@@ -1,0 +1,13 @@
+{
+  "name": "@hubzz/bot-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for spawning and controlling bots in Hubzz worlds",
+  "type": "module",
+  "main": "bot-mcp.mjs",
+  "scripts": {
+    "start": "node bot-mcp.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

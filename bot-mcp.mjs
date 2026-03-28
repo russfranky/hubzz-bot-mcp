@@ -1,0 +1,1131 @@
+#!/usr/bin/env node
+/**
+ * Hubzz Bot MCP Server — Enhanced
+ *
+ * Exposes tools for spawning, controlling, and testing batches of bots in Hubzz worlds.
+ * Connects to game servers via WebSocket using the Hubzz game protocol.
+ *
+ * Protocol: MCP (stdio newline-delimited JSON-RPC 2.0)
+ * Game protocol: JSON + U+F8FF delimiter over WebSocket
+ */
+
+import WebSocket from 'ws';
+import { EventEmitter } from 'events';
+
+// --- Configuration ---
+
+const DEFAULT_WS_URL = process.env.HUBZZ_WS_URL || 'wss://hubzz.xyz/socket/';
+const DELIMITER = '\uF8FF';
+const MAX_CHAT_BUFFER = 50;
+const MAX_EVENT_BUFFER = 200;
+const MAX_ERRORS = 50;
+const MAX_NOTICES = 20;
+const MAX_LATENCIES = 20;
+const MAX_BATCH_SIZE = 20;
+const MAX_STRESS_DURATION = 60;
+
+const AVAILABLE_EMOTES = [
+  'idle', 'wave', 'clap', 'thumbs_up', 'spawn',
+  'dance', 'dance1', 'dance2', 'dance3', 'dance4', 'dance5',
+  'dance6', 'dance7', 'dance8', 'dance9', 'dance_flair',
+  'sad', 'giddy', 'ugh', 'beg', 'yay', 'waiting',
+];
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// --- Bot Connection ---
+
+class BotConnection extends EventEmitter {
+  constructor(wsUrl, username, vrmUrl = '', opts = {}) {
+    super();
+    this.wsUrl = wsUrl;
+    this.username = username;
+    this.vrmUrl = vrmUrl;
+    this.ws = null;
+    this.connected = false;
+    this.intentionallyClosed = false;
+    this.knownUsers = new Map();
+    this.chatBuffer = [];
+    this.connectionTimeout = null;
+
+    // Position tracking
+    this.ownTile = null;
+    this.ownPosition = null;
+    this.ownRotation = null;
+
+    // Timing / health
+    this.connectedAt = null;
+    this.lastPingReceived = null;
+    this.pingLatencies = [];
+    this.messageCount = { sent: 0, received: 0 };
+
+    // Error tracking
+    this.errors = [];
+    this.disconnectCount = 0;
+
+    // Event subscription system
+    this.eventBuffer = [];
+    this.eventSubscriptions = new Set();
+
+    // System notices
+    this.notices = [];
+
+    // Entity tracking
+    this.entities = new Map();
+
+    // Patrol state
+    this.patrolRoute = null;
+
+    // Auto-reconnect
+    this.autoReconnect = opts.autoReconnect || false;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 5;
+
+    // Keepalive ping (nginx default timeout is 60s)
+    this.keepaliveTimer = null;
+  }
+
+  connect() {
+    return new Promise((resolve, reject) => {
+      this.intentionallyClosed = false;
+
+      try {
+        this.ws = new WebSocket(this.wsUrl);
+      } catch (err) {
+        this._trackError('ws_create', err.message);
+        reject(new Error(`Failed to create WebSocket: ${err.message}`));
+        return;
+      }
+
+      this.connectionTimeout = setTimeout(() => {
+        if (this.ws) this.ws.terminate();
+        this._trackError('timeout', 'Connection timed out after 10s');
+        reject(new Error('Connection timed out after 10s'));
+      }, 10000);
+
+      this.ws.on('open', () => {
+        this._send({ h: 'login', a: ['iamar0b0t', this.username, this.vrmUrl] });
+      });
+
+      this.ws.on('message', (data) => {
+        const raw = data.toString();
+        const parts = raw.split(DELIMITER).filter(m => m.length > 0);
+        for (const part of parts) {
+          try {
+            const msg = JSON.parse(part);
+            this.messageCount.received++;
+            this._handleMessage(msg, resolve, reject);
+          } catch (_) { /* skip unparseable */ }
+        }
+      });
+
+      this.ws.on('close', () => {
+        clearTimeout(this.connectionTimeout);
+        const wasConnected = this.connected;
+        this.connected = false;
+        if (wasConnected) this.disconnectCount++;
+        this._bufferEvent('disconnect', { wasConnected, intentional: this.intentionallyClosed });
+        this.emit('disconnected');
+
+        // Auto-reconnect
+        if (!this.intentionallyClosed && this.autoReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
+          this.reconnectAttempts++;
+          const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+          setTimeout(() => this.connect().catch(() => {}), delay);
+        }
+      });
+
+      this.ws.on('error', (err) => {
+        clearTimeout(this.connectionTimeout);
+        this._trackError('ws_error', err.message);
+        if (!this.connected) reject(new Error(`WebSocket error: ${err.message}`));
+      });
+    });
+  }
+
+  _handleMessage(msg, resolve, reject) {
+    switch (msg.h) {
+      case 'ping': {
+        const now = Date.now();
+        if (this.lastPingReceived) {
+          this.pingLatencies.push(now - this.lastPingReceived);
+          if (this.pingLatencies.length > MAX_LATENCIES) this.pingLatencies.shift();
+        }
+        this.lastPingReceived = now;
+        this._send({ h: 'pong', a: [] });
+        break;
+      }
+
+      case 'acc:ok':
+        clearTimeout(this.connectionTimeout);
+        this._send({ h: 'ready', a: [] });
+        this.connected = true;
+        this.connectedAt = Date.now();
+        this.reconnectAttempts = 0;
+        this._startKeepalive();
+        this.emit('ready');
+        if (resolve) resolve();
+        break;
+
+      case 'acc:fail':
+        clearTimeout(this.connectionTimeout);
+        this._trackError('auth', JSON.stringify(msg.a));
+        if (reject) reject(new Error(`Login failed: ${JSON.stringify(msg.a)}`));
+        break;
+
+      case 'w:add': {
+        const data = msg.a?.[0];
+        if (!data) break;
+        // Server sends either {id, username, type, position, ...} object or [id, username] pair
+        const userId = data.id ?? data;
+        const userName = data.username ?? msg.a?.[1] ?? 'unknown';
+        const type = data.type ?? 'avatar';
+        if (type !== 'avatar') {
+          // Entity (screen, drone, text, etc.) — track separately
+          this.entities.set(String(userId), { id: String(userId), type, position: data.position });
+          this._bufferEvent('w:add', { userId, type, entity: true });
+          break;
+        }
+        this.knownUsers.set(String(userId), {
+          id: String(userId),
+          username: String(userName),
+          tile: 0,
+          position: data.position || null,
+          rotation: data.rotation || null,
+          animation: data.animation || null,
+        });
+        this._bufferEvent('w:add', { userId, userName, type });
+        break;
+      }
+
+      case 'w:rem': {
+        const data = msg.a?.[0];
+        const userId = String(typeof data === 'object' ? data.id ?? data : data);
+        this.knownUsers.delete(userId);
+        this.entities.delete(userId);
+        this._bufferEvent('w:rem', { userId });
+        break;
+      }
+
+      case 'w:move': {
+        const [userId, tileId] = msg.a;
+        const user = this.knownUsers.get(String(userId));
+        if (user) user.tile = Number(tileId);
+        this._bufferEvent('w:move', { userId, tileId });
+        break;
+      }
+
+      case 'chat': {
+        const [userId, message] = msg.a;
+        const user = this.knownUsers.get(String(userId));
+        const entry = {
+          userId: String(userId),
+          username: user?.username ?? 'unknown',
+          message: String(message),
+          timestamp: Date.now(),
+        };
+        this.chatBuffer.push(entry);
+        if (this.chatBuffer.length > MAX_CHAT_BUFFER) this.chatBuffer.shift();
+        this._bufferEvent('chat', entry);
+        break;
+      }
+
+      case 'w:ready':
+        this._bufferEvent('w:ready', {});
+        this.emit('worldReady');
+        break;
+
+      case 'w:call': {
+        const [target, func, ...callArgs] = msg.a || [];
+        this._bufferEvent('w:call', { target, func, args: callArgs });
+        break;
+      }
+
+      case 'w:o':
+        this._bufferEvent('w:o', { overrides: msg.a });
+        break;
+
+      case 'w:loadSpace':
+        this._bufferEvent('w:loadSpace', { data: msg.a });
+        break;
+
+      case 'notice':
+      case 'snotice': {
+        const notice = { type: msg.h, text: msg.a?.[0], timestamp: Date.now() };
+        this.notices.push(notice);
+        if (this.notices.length > MAX_NOTICES) this.notices.shift();
+        this._bufferEvent('notice', notice);
+        break;
+      }
+
+      case 'redirect':
+        this._bufferEvent('redirect', { target: msg.a?.[0] });
+        break;
+
+      case 'disconnect':
+        this._bufferEvent('disconnect', { reason: msg.a?.[0] });
+        break;
+
+      case 'kbs': {
+        // Position sync from another user: [userId, position, rotation, animation]
+        const [userId, pos, rot, anim] = msg.a || [];
+        const user = this.knownUsers.get(String(userId));
+        if (user) {
+          if (pos) user.position = pos;
+          if (rot) user.rotation = rot;
+          if (anim) user.animation = anim;
+        }
+        break;
+      }
+
+      case 'emote': {
+        const [userId, animation] = msg.a || [];
+        this._bufferEvent('emote', { userId, animation });
+        break;
+      }
+
+      case 'ts': {
+        const [userId, typing] = msg.a || [];
+        this._bufferEvent('ts', { userId, typing });
+        break;
+      }
+    }
+  }
+
+  _bufferEvent(type, data) {
+    if (this.eventSubscriptions.has('*') || this.eventSubscriptions.has(type)) {
+      this.eventBuffer.push({ type, data, timestamp: Date.now() });
+      if (this.eventBuffer.length > MAX_EVENT_BUFFER) this.eventBuffer.shift();
+    }
+  }
+
+  _trackError(type, detail) {
+    this.errors.push({ type, detail, timestamp: Date.now() });
+    if (this.errors.length > MAX_ERRORS) this.errors.shift();
+    this._bufferEvent('error', { type, detail });
+  }
+
+  _send(data) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(data) + DELIMITER);
+      this.messageCount.sent++;
+    }
+  }
+
+  // --- Keepalive ---
+
+  _startKeepalive() {
+    this._stopKeepalive();
+    this.keepaliveTimer = setInterval(() => {
+      if (this.connected) this._send({ h: 'ping', a: [] });
+    }, 30000);
+  }
+
+  _stopKeepalive() {
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
+  }
+
+  // --- Actions ---
+
+  moveToTile(tileId) { this._send({ h: 'w:move', a: [tileId] }); }
+  sendChat(message) { this._send({ h: 'chat', a: [message] }); }
+  sendEmote(animation) { this._send({ h: 'emote', a: [animation, false] }); }
+  sendRotation(x, y, z) { this._send({ h: 'w:rot', a: [{ x, y, z }] }); }
+  sendLookAt(x, y, z) { this._send({ h: 'w:lookAt', a: [{ x, y, z }] }); }
+  sendTypingStatus(isTyping) { this._send({ h: 'ts', a: [isTyping] }); }
+  sendSetAvatar(asset) { this._send({ h: 'setAvatar', a: [asset] }); }
+
+  // --- Patrol ---
+
+  startPatrol(tiles, intervalMs = 2000, loop = true) {
+    this.stopPatrol();
+    if (!tiles || tiles.length === 0) return;
+    this.patrolRoute = { tiles, index: 0, intervalMs, loop, timer: null };
+    const step = () => {
+      if (!this.connected || !this.patrolRoute) return;
+      const tile = this.patrolRoute.tiles[this.patrolRoute.index];
+      this.moveToTile(tile);
+      this.ownTile = tile;
+      this.patrolRoute.index++;
+      if (this.patrolRoute.index >= this.patrolRoute.tiles.length) {
+        if (this.patrolRoute.loop) {
+          this.patrolRoute.index = 0;
+        } else {
+          this.stopPatrol();
+        }
+      }
+    };
+    step(); // first move immediately
+    this.patrolRoute.timer = setInterval(step, intervalMs);
+  }
+
+  stopPatrol() {
+    if (this.patrolRoute?.timer) {
+      clearInterval(this.patrolRoute.timer);
+      this.patrolRoute.timer = null;
+    }
+    this.patrolRoute = null;
+  }
+
+  // --- State / Reporting ---
+
+  getHealthStats() {
+    const uptime = this.connectedAt ? Date.now() - this.connectedAt : 0;
+    const avgLatency = this.pingLatencies.length > 0
+      ? Math.round(this.pingLatencies.reduce((a, b) => a + b, 0) / this.pingLatencies.length)
+      : null;
+    return {
+      uptime,
+      uptimeFormatted: `${Math.floor(uptime / 60000)}m ${Math.floor((uptime % 60000) / 1000)}s`,
+      avgLatencyMs: avgLatency,
+      messagesSent: this.messageCount.sent,
+      messagesReceived: this.messageCount.received,
+      errorCount: this.errors.length,
+      disconnects: this.disconnectCount,
+      reconnectAttempts: this.reconnectAttempts,
+    };
+  }
+
+  getState() {
+    return {
+      connected: this.connected,
+      username: this.username,
+      wsUrl: this.wsUrl,
+      users: Array.from(this.knownUsers.values()),
+      recentChat: this.chatBuffer.slice(-10),
+    };
+  }
+
+  getFullState() {
+    return {
+      connected: this.connected,
+      username: this.username,
+      wsUrl: this.wsUrl,
+      ownTile: this.ownTile,
+      users: Array.from(this.knownUsers.values()),
+      recentChat: this.chatBuffer.slice(-10),
+      notices: this.notices.slice(-5),
+      health: this.getHealthStats(),
+      entityCount: this.entities.size,
+      eventBufferSize: this.eventBuffer.length,
+      patrolling: !!(this.patrolRoute?.timer),
+      subscriptions: Array.from(this.eventSubscriptions),
+    };
+  }
+
+  close() {
+    this.intentionallyClosed = true;
+    this.stopPatrol();
+    this._stopKeepalive();
+    clearTimeout(this.connectionTimeout);
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    this.connected = false;
+    this.knownUsers.clear();
+    this.chatBuffer = [];
+    this.eventBuffer = [];
+    this.eventSubscriptions.clear();
+  }
+}
+
+// --- Bot Manager ---
+
+const bots = new Map();
+
+// --- MCP Protocol (stdio JSON-RPC) ---
+
+function sendResponse(id, result) {
+  const msg = JSON.stringify({ jsonrpc: '2.0', id, result });
+  process.stdout.write(msg + '\n');
+}
+
+function sendError(id, code, message) {
+  const msg = JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } });
+  process.stdout.write(msg + '\n');
+}
+
+// --- Helper: get bot or return error ---
+
+function getBot(name, requireConnected = true) {
+  const bot = bots.get(name);
+  if (!bot) return { error: `Bot "${name}" not found` };
+  if (requireConnected && !bot.connected) return { error: `Bot "${name}" is not connected` };
+  return bot;
+}
+
+// --- Tool Definitions ---
+
+const TOOLS = [
+  // === Original tools ===
+  {
+    name: 'bot_spawn',
+    description: 'Spawn a bot that connects to a Hubzz world. Returns when connected and ready.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot username (unique identifier)' },
+        wsUrl: { type: 'string', description: `WebSocket URL (default: ${DEFAULT_WS_URL})` },
+        vrmUrl: { type: 'string', description: 'VRM avatar URL (optional)' },
+        autoReconnect: { type: 'boolean', description: 'Enable auto-reconnect on disconnect (default: false)' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_move',
+    description: 'Move a bot to a specific tile in the world.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        tileId: { type: 'number', description: 'Tile ID to move to' },
+      },
+      required: ['name', 'tileId'],
+    },
+  },
+  {
+    name: 'bot_chat',
+    description: 'Make a bot send a chat message visible to all nearby users.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        message: { type: 'string', description: 'Chat message to send' },
+      },
+      required: ['name', 'message'],
+    },
+  },
+  {
+    name: 'bot_emote',
+    description: 'Play an animation (legacy — prefer bot_dance for full emote list).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        animation: { type: 'string', description: 'Animation name', enum: ['idle', 'wave', 'dance_flair', 'clap', 'thumbs_up', 'spawn'] },
+      },
+      required: ['name', 'animation'],
+    },
+  },
+  {
+    name: 'bot_look',
+    description: 'Get comprehensive world state from a bot — users, chat, health, position, notices.',
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Bot name' } },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_close',
+    description: 'Disconnect and remove a bot.',
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Bot name' } },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_voice',
+    description: 'Toggle voice state for a bot (shows mic indicator to other users).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        state: { type: 'boolean', description: 'true = mic on, false = mic off' },
+      },
+      required: ['name', 'state'],
+    },
+  },
+  {
+    name: 'bot_list',
+    description: 'List all active bots and their connection status.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'bot_close_all',
+    description: 'Disconnect and remove all bots.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+
+  // === New tools ===
+  {
+    name: 'bot_batch_spawn',
+    description: 'Spawn multiple bots at once with staggered connections. Returns status of all spawns.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prefix: { type: 'string', description: 'Name prefix (bots named prefix-0, prefix-1, ...)' },
+        count: { type: 'number', description: 'Number of bots to spawn (1-20)' },
+        wsUrl: { type: 'string', description: `WebSocket URL (default: ${DEFAULT_WS_URL})` },
+        vrmUrl: { type: 'string', description: 'VRM avatar URL (optional, same for all)' },
+        staggerMs: { type: 'number', description: 'Delay between each spawn in ms (default: 500)' },
+        autoReconnect: { type: 'boolean', description: 'Enable auto-reconnect (default: false)' },
+      },
+      required: ['prefix', 'count'],
+    },
+  },
+  {
+    name: 'bot_observe',
+    description: 'Get comprehensive world state from a bot: all users with positions, full chat log, events, latency, health.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        includeChat: { type: 'boolean', description: 'Include full chat buffer (default: true)' },
+        includeEvents: { type: 'boolean', description: 'Include event buffer (default: false)' },
+        includeNotices: { type: 'boolean', description: 'Include system notices (default: true)' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_patrol',
+    description: 'Make a bot walk through a sequence of tiles on a timer. Useful for movement testing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        tiles: { type: 'array', items: { type: 'number' }, description: 'Array of tile IDs to visit in order' },
+        intervalMs: { type: 'number', description: 'Milliseconds between each move (default: 2000)' },
+        loop: { type: 'boolean', description: 'Loop back to start after finishing (default: true)' },
+        action: { type: 'string', enum: ['start', 'stop', 'status'], description: 'Action (default: start)' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_stress_test',
+    description: 'Run a stress test: spawn N bots, have them act simultaneously, auto-cleanup, return report.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prefix: { type: 'string', description: 'Bot name prefix' },
+        count: { type: 'number', description: 'Number of bots (1-20)' },
+        wsUrl: { type: 'string', description: 'WebSocket URL' },
+        test: { type: 'string', enum: ['connect', 'chat_flood', 'move_flood', 'mixed'], description: 'Test type' },
+        durationSec: { type: 'number', description: 'Test duration in seconds (default: 10, max: 60)' },
+        messagesPerSec: { type: 'number', description: 'Messages per second per bot (default: 1, max: 5)' },
+      },
+      required: ['prefix', 'count', 'test'],
+    },
+  },
+  {
+    name: 'bot_set_avatar',
+    description: 'Change a bot\'s avatar via setAvatar protocol or !shuffle chat command.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        method: { type: 'string', enum: ['vrm', 'shuffle'], description: 'vrm = set VRM URL, shuffle = random avatar' },
+        vrmUrl: { type: 'string', description: 'VRM URL (required if method is vrm)' },
+        collection: { type: 'string', description: 'Collection slug for shuffle (optional)' },
+      },
+      required: ['name', 'method'],
+    },
+  },
+  {
+    name: 'bot_nick',
+    description: 'Change a bot\'s display name via the !nick chat command.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name (manager key)' },
+        newNick: { type: 'string', description: 'New display name' },
+      },
+      required: ['name', 'newNick'],
+    },
+  },
+  {
+    name: 'bot_dance',
+    description: `Make a bot play any animation. Available: ${AVAILABLE_EMOTES.join(', ')} — or any custom animation name.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        animation: { type: 'string', description: 'Animation name' },
+        useChat: { type: 'boolean', description: 'Send as !anim chat command instead of protocol message (default: false)' },
+      },
+      required: ['name', 'animation'],
+    },
+  },
+  {
+    name: 'bot_subscribe',
+    description: 'Subscribe a bot to collect specific event types in a buffer for later retrieval.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        events: { type: 'array', items: { type: 'string' }, description: 'Event types: chat, w:add, w:rem, w:move, notice, w:call, emote, ts, error, disconnect, or * for all' },
+        action: { type: 'string', enum: ['subscribe', 'unsubscribe', 'clear', 'read'], description: 'Action (default: subscribe)' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_report',
+    description: 'Generate a summary report from one or all bots: uptime, users, chat volume, latency, errors.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name (omit for all bots)' },
+        format: { type: 'string', enum: ['summary', 'detailed'], description: 'Report detail level (default: summary)' },
+      },
+    },
+  },
+];
+
+// --- Tool Handlers ---
+
+async function handleTool(name, args) {
+  switch (name) {
+
+    // === Original tools ===
+
+    case 'bot_spawn': {
+      const botName = args.name;
+      if (bots.has(botName)) return { error: `Bot "${botName}" already exists. Close it first or use a different name.` };
+      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const bot = new BotConnection(wsUrl, botName, args.vrmUrl || '', { autoReconnect: args.autoReconnect || false });
+      try {
+        await bot.connect();
+        bots.set(botName, bot);
+        await sleep(1000);
+        return { status: 'connected', name: botName, wsUrl, usersInWorld: bot.knownUsers.size };
+      } catch (err) {
+        bot.close();
+        return { error: `Failed to spawn bot: ${err.message}` };
+      }
+    }
+
+    case 'bot_move': {
+      const r = getBot(args.name); if (r.error) return r;
+      r.moveToTile(args.tileId);
+      r.ownTile = args.tileId;
+      return { status: 'moved', name: args.name, tileId: args.tileId };
+    }
+
+    case 'bot_chat': {
+      const r = getBot(args.name); if (r.error) return r;
+      r.sendChat(args.message);
+      return { status: 'sent', name: args.name, message: args.message };
+    }
+
+    case 'bot_emote': {
+      const r = getBot(args.name); if (r.error) return r;
+      r.sendEmote(args.animation);
+      return { status: 'emote_sent', name: args.name, animation: args.animation };
+    }
+
+    case 'bot_voice': {
+      const r = getBot(args.name); if (r.error) return r;
+      r._send({ h: 'voiceState', a: [args.state] });
+      return { status: 'voice_toggled', name: args.name, state: args.state };
+    }
+
+    case 'bot_look': {
+      const r = getBot(args.name, false); if (r.error) return r;
+      return r.getFullState();
+    }
+
+    case 'bot_close': {
+      const bot = bots.get(args.name);
+      if (!bot) return { error: `Bot "${args.name}" not found` };
+      bot.close();
+      bots.delete(args.name);
+      return { status: 'closed', name: args.name };
+    }
+
+    case 'bot_list': {
+      const list = [];
+      for (const [n, bot] of bots) {
+        list.push({ name: n, connected: bot.connected, wsUrl: bot.wsUrl, usersInWorld: bot.knownUsers.size, uptime: bot.connectedAt ? Date.now() - bot.connectedAt : 0 });
+      }
+      return { bots: list, count: list.length };
+    }
+
+    case 'bot_close_all': {
+      const names = Array.from(bots.keys());
+      for (const [, bot] of bots) bot.close();
+      bots.clear();
+      return { status: 'all_closed', closed: names };
+    }
+
+    // === New tools ===
+
+    case 'bot_batch_spawn': {
+      const count = Math.min(Math.max(1, args.count || 1), MAX_BATCH_SIZE);
+      const staggerMs = args.staggerMs ?? 500;
+      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const results = [];
+      const startTime = Date.now();
+
+      for (let i = 0; i < count; i++) {
+        const botName = `${args.prefix}-${i}`;
+        if (bots.has(botName)) {
+          results.push({ name: botName, status: 'skipped', error: 'already exists' });
+          continue;
+        }
+        const bot = new BotConnection(wsUrl, botName, args.vrmUrl || '', { autoReconnect: args.autoReconnect || false });
+        try {
+          await bot.connect();
+          bots.set(botName, bot);
+          results.push({ name: botName, status: 'connected' });
+        } catch (err) {
+          bot.close();
+          results.push({ name: botName, status: 'failed', error: err.message });
+        }
+        if (i < count - 1 && staggerMs > 0) await sleep(staggerMs);
+      }
+
+      const spawned = results.filter(r => r.status === 'connected').length;
+      const failed = results.filter(r => r.status === 'failed').length;
+      return { spawned, failed, skipped: results.length - spawned - failed, results, totalTimeMs: Date.now() - startTime };
+    }
+
+    case 'bot_observe': {
+      const r = getBot(args.name, false); if (r.error) return r;
+      const includeChat = args.includeChat !== false;
+      const includeEvents = args.includeEvents || false;
+      const includeNotices = args.includeNotices !== false;
+
+      const result = {
+        connection: r.getHealthStats(),
+        users: Array.from(r.knownUsers.values()),
+        ownTile: r.ownTile,
+        summary: {
+          userCount: r.knownUsers.size,
+          chatCount: r.chatBuffer.length,
+          connected: r.connected,
+        },
+      };
+      if (includeChat) result.chat = r.chatBuffer;
+      if (includeNotices) result.notices = r.notices;
+      if (includeEvents) result.events = r.eventBuffer;
+      return result;
+    }
+
+    case 'bot_patrol': {
+      const action = args.action || 'start';
+      const r = getBot(args.name); if (r.error) return r;
+
+      if (action === 'stop') {
+        r.stopPatrol();
+        return { status: 'stopped', name: args.name };
+      }
+      if (action === 'status') {
+        if (!r.patrolRoute) return { status: 'idle', name: args.name };
+        return { status: 'patrolling', name: args.name, index: r.patrolRoute.index, total: r.patrolRoute.tiles.length, loop: r.patrolRoute.loop };
+      }
+      // start
+      if (!args.tiles || args.tiles.length === 0) return { error: 'tiles array is required for start action' };
+      r.startPatrol(args.tiles, args.intervalMs || 2000, args.loop !== false);
+      return { status: 'patrolling', name: args.name, tiles: args.tiles.length, intervalMs: args.intervalMs || 2000, loop: args.loop !== false };
+    }
+
+    case 'bot_stress_test': {
+      const count = Math.min(Math.max(1, args.count || 1), MAX_BATCH_SIZE);
+      const durationSec = Math.min(Math.max(1, args.durationSec || 10), MAX_STRESS_DURATION);
+      const mps = Math.min(Math.max(0.1, args.messagesPerSec || 1), 5);
+      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const test = args.test;
+      const testBots = [];
+      const metrics = { botsSpawned: 0, botsFailed: 0, messagesAttempted: 0, messagesFailed: 0, droppedConnections: 0, errors: [] };
+
+      // Spawn
+      const spawnStart = Date.now();
+      for (let i = 0; i < count; i++) {
+        const botName = `_stress_${args.prefix}-${i}`;
+        if (bots.has(botName)) { bots.get(botName).close(); bots.delete(botName); }
+        const bot = new BotConnection(wsUrl, botName, '', {});
+        try {
+          await bot.connect();
+          bots.set(botName, bot);
+          testBots.push(bot);
+          metrics.botsSpawned++;
+        } catch (err) {
+          bot.close();
+          metrics.botsFailed++;
+          metrics.errors.push(`spawn ${botName}: ${err.message}`);
+        }
+        if (i < count - 1) await sleep(200);
+      }
+      const spawnTimeMs = Date.now() - spawnStart;
+
+      if (test === 'connect') {
+        // Just measure spawn, then cleanup
+        for (const bot of testBots) { bot.close(); bots.delete(`_stress_${args.prefix}-${testBots.indexOf(bot)}`); }
+        return { test: 'connect', ...metrics, spawnTimeMs, avgSpawnMs: metrics.botsSpawned > 0 ? Math.round(spawnTimeMs / metrics.botsSpawned) : null };
+      }
+
+      // Wait for world state
+      await sleep(1000);
+
+      // Run test
+      const intervalMs = Math.round(1000 / mps);
+      const timers = [];
+      const testStart = Date.now();
+
+      for (const bot of testBots) {
+        const timer = setInterval(() => {
+          if (!bot.connected) { metrics.droppedConnections++; return; }
+          try {
+            metrics.messagesAttempted++;
+            if (test === 'chat_flood') {
+              bot.sendChat(`stress test ${Date.now()}`);
+            } else if (test === 'move_flood') {
+              bot.moveToTile(Math.floor(Math.random() * 500));
+            } else { // mixed
+              const r = Math.random();
+              if (r < 0.4) bot.sendChat(`stress ${Date.now()}`);
+              else if (r < 0.8) bot.moveToTile(Math.floor(Math.random() * 500));
+              else bot.sendEmote(AVAILABLE_EMOTES[Math.floor(Math.random() * AVAILABLE_EMOTES.length)]);
+            }
+          } catch (err) {
+            metrics.messagesFailed++;
+            metrics.errors.push(err.message);
+          }
+        }, intervalMs);
+        timers.push(timer);
+      }
+
+      // Wait for test duration
+      await sleep(durationSec * 1000);
+
+      // Cleanup
+      for (const timer of timers) clearInterval(timer);
+      const testTimeMs = Date.now() - testStart;
+
+      // Collect latency stats
+      const latencies = testBots.filter(b => b.pingLatencies.length > 0).map(b => b.pingLatencies.reduce((a, c) => a + c, 0) / b.pingLatencies.length);
+      const avgLatency = latencies.length > 0 ? Math.round(latencies.reduce((a, c) => a + c, 0) / latencies.length) : null;
+
+      // Close test bots
+      for (let i = 0; i < testBots.length; i++) {
+        const botName = `_stress_${args.prefix}-${i}`;
+        testBots[i].close();
+        bots.delete(botName);
+      }
+
+      return {
+        test,
+        ...metrics,
+        spawnTimeMs,
+        testDurationMs: testTimeMs,
+        messagesPerSecPerBot: mps,
+        avgLatencyMs: avgLatency,
+        errors: metrics.errors.slice(-10),
+      };
+    }
+
+    case 'bot_set_avatar': {
+      const r = getBot(args.name); if (r.error) return r;
+      if (args.method === 'shuffle') {
+        const cmd = args.collection ? `!shuffle ${args.collection}` : '!shuffle';
+        r.sendChat(cmd);
+        return { status: 'shuffle_sent', name: args.name, collection: args.collection || 'default' };
+      }
+      if (!args.vrmUrl) return { error: 'vrmUrl is required when method is vrm' };
+      r.sendSetAvatar(args.vrmUrl);
+      return { status: 'avatar_set', name: args.name, vrmUrl: args.vrmUrl };
+    }
+
+    case 'bot_nick': {
+      const r = getBot(args.name); if (r.error) return r;
+      r.sendChat(`!nick ${args.newNick}`);
+      return { status: 'nick_sent', name: args.name, newNick: args.newNick };
+    }
+
+    case 'bot_dance': {
+      const r = getBot(args.name); if (r.error) return r;
+      if (!/^[a-zA-Z0-9_]+$/.test(args.animation)) return { error: 'Animation name must be alphanumeric + underscore' };
+      if (args.useChat) {
+        r.sendChat(`!anim ${args.animation}`);
+      } else {
+        r.sendEmote(args.animation);
+      }
+      return { status: 'dance_sent', name: args.name, animation: args.animation, viaChat: !!args.useChat };
+    }
+
+    case 'bot_subscribe': {
+      const r = getBot(args.name, false); if (r.error) return r;
+      const action = args.action || 'subscribe';
+      const events = args.events || ['*'];
+
+      if (action === 'subscribe') {
+        for (const e of events) r.eventSubscriptions.add(e);
+        return { status: 'subscribed', name: args.name, subscriptions: Array.from(r.eventSubscriptions) };
+      }
+      if (action === 'unsubscribe') {
+        for (const e of events) r.eventSubscriptions.delete(e);
+        return { status: 'unsubscribed', name: args.name, subscriptions: Array.from(r.eventSubscriptions) };
+      }
+      if (action === 'clear') {
+        r.eventBuffer = [];
+        return { status: 'cleared', name: args.name };
+      }
+      if (action === 'read') {
+        const events = [...r.eventBuffer];
+        r.eventBuffer = [];
+        return { events, count: events.length };
+      }
+      return { error: `Unknown action: ${action}` };
+    }
+
+    case 'bot_report': {
+      const detailed = args.format === 'detailed';
+
+      const buildBotReport = (n, bot) => {
+        const report = {
+          name: n,
+          connected: bot.connected,
+          uptime: bot.connectedAt ? Date.now() - bot.connectedAt : 0,
+          usersObserved: bot.knownUsers.size,
+          chatMessages: bot.chatBuffer.length,
+          messagesSent: bot.messageCount.sent,
+          messagesReceived: bot.messageCount.received,
+          avgLatencyMs: bot.pingLatencies.length > 0 ? Math.round(bot.pingLatencies.reduce((a, b) => a + b, 0) / bot.pingLatencies.length) : null,
+          errors: bot.errors.length,
+          disconnects: bot.disconnectCount,
+          patrolling: !!(bot.patrolRoute?.timer),
+        };
+        if (detailed) {
+          report.recentErrors = bot.errors.slice(-5);
+          report.recentNotices = bot.notices.slice(-5);
+          report.recentChat = bot.chatBuffer.slice(-5);
+        }
+        return report;
+      };
+
+      if (args.name) {
+        const bot = bots.get(args.name);
+        if (!bot) return { error: `Bot "${args.name}" not found` };
+        return { generatedAt: new Date().toISOString(), report: buildBotReport(args.name, bot) };
+      }
+
+      // All bots
+      const reports = [];
+      const allUsers = new Set();
+      let totalChat = 0, totalErrors = 0, totalSent = 0, totalReceived = 0, latencySum = 0, latencyCount = 0;
+
+      for (const [n, bot] of bots) {
+        const r = buildBotReport(n, bot);
+        reports.push(r);
+        for (const u of bot.knownUsers.values()) allUsers.add(u.username);
+        totalChat += bot.chatBuffer.length;
+        totalErrors += bot.errors.length;
+        totalSent += bot.messageCount.sent;
+        totalReceived += bot.messageCount.received;
+        if (r.avgLatencyMs !== null) { latencySum += r.avgLatencyMs; latencyCount++; }
+      }
+
+      return {
+        generatedAt: new Date().toISOString(),
+        botCount: bots.size,
+        bots: reports,
+        aggregate: {
+          totalBots: bots.size,
+          connectedBots: reports.filter(r => r.connected).length,
+          uniqueUsersObserved: allUsers.size,
+          totalChatMessages: totalChat,
+          totalMessagesSent: totalSent,
+          totalMessagesReceived: totalReceived,
+          totalErrors,
+          avgLatencyMs: latencyCount > 0 ? Math.round(latencySum / latencyCount) : null,
+        },
+      };
+    }
+
+    default:
+      return { error: `Unknown tool: ${name}` };
+  }
+}
+
+// --- MCP Request Handler ---
+
+async function handleRequest(request) {
+  const { id, method, params } = request;
+
+  switch (method) {
+    case 'initialize':
+      sendResponse(id, {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'hubzz-bot-mcp', version: '2.0.0' },
+      });
+      break;
+
+    case 'notifications/initialized':
+      break;
+
+    case 'tools/list':
+      sendResponse(id, { tools: TOOLS });
+      break;
+
+    case 'tools/call': {
+      const { name, arguments: args } = params;
+      try {
+        const result = await handleTool(name, args || {});
+        sendResponse(id, {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        });
+      } catch (err) {
+        sendResponse(id, {
+          content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }],
+          isError: true,
+        });
+      }
+      break;
+    }
+
+    default:
+      if (id) sendError(id, -32601, `Method not found: ${method}`);
+      break;
+  }
+}
+
+// --- stdio Message Parser (newline-delimited JSON) ---
+
+let buffer = '';
+
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+
+  let newlineIdx;
+  while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
+    const line = buffer.slice(0, newlineIdx).trim();
+    buffer = buffer.slice(newlineIdx + 1);
+
+    if (!line) continue;
+
+    try {
+      const request = JSON.parse(line);
+      handleRequest(request).catch(err => {
+        console.error('Error handling request:', err);
+        if (request.id) sendError(request.id, -32603, err.message);
+      });
+    } catch (err) {
+      console.error('Failed to parse JSON-RPC:', err);
+    }
+  }
+});
+
+// Cleanup on exit
+process.on('SIGINT', () => {
+  for (const [, bot] of bots) bot.close();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  for (const [, bot] of bots) bot.close();
+  process.exit(0);
+});
+
+// Keep alive
+process.stdin.resume();
