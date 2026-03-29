@@ -883,6 +883,7 @@ const TOOLS = [
         centerTileId: { type: 'number', description: 'Reference tile ID to measure from (default: nearest walkable tile to world origin)' },
         mapUrl: { type: 'string', description: 'Map JSON URL (default: https://hubzz.xyz/data/maps/world_2.json)' },
         showFalloff: { type: 'boolean', description: 'Include predicted volume falloff based on current spatial audio config (default: true)' },
+        direction: { description: 'Constrain results to a compass sector: N, S, E, W, NE, NW, SE, SW — or a number in degrees (0=East, 90=North). Leave unset for nearest-tile regardless of direction.' },
       },
       required: ['distances'],
     },
@@ -969,6 +970,51 @@ const TOOLS = [
       type: 'object',
       properties: {
         name: { type: 'string', description: 'Bot name (omit for all)' },
+      },
+    },
+  },
+  {
+    name: 'bot_spawn_at',
+    description: 'Spawn a bot and immediately move it to a tile — combines bot_spawn + bot_move in one call.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot username' },
+        tileId: { type: 'number', description: 'Tile ID to place the bot at' },
+        wsUrl: { type: 'string', description: `WebSocket URL (default: ${DEFAULT_WS_URL})` },
+        vrmUrl: { type: 'string', description: 'VRM avatar URL (optional)' },
+        voiceOn: { type: 'boolean', description: 'Enable voice indicator immediately (default: false)' },
+      },
+      required: ['name', 'tileId'],
+    },
+  },
+  {
+    name: 'bot_directional_ring',
+    description: 'Place bots in a ring at equal distance from center, evenly spaced around the compass, each producing a distinct tone. Use this to test spatial audio directionality (left/right/front/behind panning) in first-person perspective.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        distance: { type: 'number', description: 'Distance from center in world units (default: 10)' },
+        count: { type: 'number', description: 'Number of bots in the ring: 4 (N/E/S/W) or 8 (adds diagonals). Default: 4' },
+        directions: { type: 'array', items: { type: 'string' }, description: 'Explicit directions to use, e.g. ["N","E","S","W"]. Overrides count.' },
+        baseFreq: { type: 'number', description: 'Base frequency for first bot in Hz (default: 220). Each subsequent bot is 1.5x higher.' },
+        gain: { type: 'number', description: 'Gain 0.0–1.0 (default: 0.7)' },
+        prefix: { type: 'string', description: 'Bot name prefix (default: "dir")' },
+        wsUrl: { type: 'string', description: `WebSocket URL (default: ${DEFAULT_WS_URL})` },
+        mapUrl: { type: 'string', description: 'Map JSON URL (default: world_2.json)' },
+        centerTileId: { type: 'number', description: 'Center tile to stand on (default: world origin)' },
+        startAudio: { type: 'boolean', description: 'Start audio tones immediately (default: true)' },
+      },
+    },
+  },
+  {
+    name: 'bot_scene_audio',
+    description: 'All-in-one spatial audio test scene manager. Actions: "setup" (kill existing + spawn distance bots + conductor), "setup_ring" (kill existing + spawn directional ring + conductor), "status" (show all running bots + audio sessions), "teardown" (kill everything).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['setup', 'setup_ring', 'status', 'teardown'], description: 'What to do (default: setup)' },
+        wsUrl: { type: 'string', description: `WebSocket URL (default: ${DEFAULT_WS_URL})` },
       },
     },
   },
@@ -1065,8 +1111,9 @@ async function handleTool(name, args) {
 
     case 'bot_voice': {
       const r = getBot(args.name); if (r.error) return r;
-      r._send({ h: 'voiceState', a: [args.state] });
-      return { status: 'voice_toggled', name: args.name, state: args.state };
+      const state = args.state ?? args.voiceState ?? true;
+      r._send({ h: 'voiceState', a: [state] });
+      return { status: 'voice_toggled', name: args.name, state };
     }
 
     case 'bot_look': {
@@ -1406,21 +1453,61 @@ async function handleTool(name, args) {
       }
 
       const cx = center.x, cz = center.z;
+
+      // Parse optional direction into angle (degrees, 0=East/+X, 90=North/-Z, 180=West/-X, 270=South/+Z)
+      const directionAngles = { E: 0, NE: 45, N: 90, NW: 135, W: 180, SW: 225, S: 270, SE: 315 };
+      let angleFilter = null;
+      let angleSector = 45; // ±degrees around target angle to accept
+      if (args.direction != null) {
+        if (typeof args.direction === 'string') {
+          const key = args.direction.toUpperCase();
+          if (key in directionAngles) angleFilter = directionAngles[key];
+          else return { error: `Unknown direction "${args.direction}". Use N, S, E, W, NE, NW, SE, SW or a number.` };
+        } else {
+          angleFilter = Number(args.direction);
+        }
+      }
+
       const results = [];
 
       for (const targetDist of distances) {
-        const best = walkable.reduce((b, t) => {
-          const da = Math.abs(dist2d(t, cx, cz) - targetDist);
-          const db = Math.abs(dist2d(b, cx, cz) - targetDist);
-          return da < db ? t : b;
-        });
+        let best;
+        if (angleFilter !== null) {
+          // Filter to tiles within the angular sector, then find nearest to target distance
+          const targetRad = (angleFilter * Math.PI) / 180;
+          const sectorRad = (angleSector * Math.PI) / 180;
+          const inSector = walkable.filter(t => {
+            const dx = t.x - cx, dz = -(t.z - cz); // flip Z: -Z = north in world
+            const angle = Math.atan2(dz, dx); // 0 = east
+            let diff = angle - targetRad;
+            while (diff > Math.PI) diff -= 2 * Math.PI;
+            while (diff < -Math.PI) diff += 2 * Math.PI;
+            return Math.abs(diff) <= sectorRad;
+          });
+          const pool = inSector.length > 0 ? inSector : walkable;
+          best = pool.reduce((b, t) => {
+            const da = Math.abs(dist2d(t, cx, cz) - targetDist);
+            const db = Math.abs(dist2d(b, cx, cz) - targetDist);
+            return da < db ? t : b;
+          });
+        } else {
+          best = walkable.reduce((b, t) => {
+            const da = Math.abs(dist2d(t, cx, cz) - targetDist);
+            const db = Math.abs(dist2d(b, cx, cz) - targetDist);
+            return da < db ? t : b;
+          });
+        }
+
         const actual = dist2d(best, cx, cz);
+        const dx = best.x - cx, dz = -(best.z - cz);
+        const actualAngleDeg = Math.round((Math.atan2(dz, dx) * 180) / Math.PI);
         const entry = {
           tileId: best.id,
-          label: `${targetDist}u`,
+          label: args.direction ? `${targetDist}u-${args.direction}` : `${targetDist}u`,
           targetDistance: targetDist,
           actualDistance: Math.round(actual * 100) / 100,
           position: { x: Math.round(best.x * 10) / 10, z: Math.round(best.z * 10) / 10 },
+          angleDeg: actualAngleDeg,
         };
         if (showFalloff) {
           entry.predictedGain = Math.round(spatialGain(actual) * 1000) / 1000;
@@ -1556,6 +1643,238 @@ async function handleTool(name, args) {
       const all = [];
       for (const [, s] of rtcSessions) all.push(s.getState());
       return { sessions: all, count: all.length };
+    }
+
+    case 'bot_spawn_at': {
+      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const bot = new BotConnection(wsUrl, args.name, args.vrmUrl || '', {});
+      try {
+        await bot.connect();
+        bots.set(args.name, bot);
+        await sleep(300);
+        bot.moveToTile(args.tileId);
+        bot.ownTile = args.tileId;
+        if (args.voiceOn) {
+          await sleep(200);
+          bot._send({ h: 'voiceState', a: [true] });
+        }
+        return { status: 'ready', name: args.name, tileId: args.tileId, voiceOn: !!args.voiceOn };
+      } catch (err) {
+        bot.close();
+        bots.delete(args.name);
+        return { error: err.message };
+      }
+    }
+
+    case 'bot_directional_ring': {
+      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const mapUrl = args.mapUrl || 'https://hubzz.xyz/data/maps/world_2.json';
+      const distance = args.distance ?? 10;
+      const prefix = args.prefix || 'dir';
+      const gain = args.gain ?? 0.7;
+      const startAudio = args.startAudio !== false;
+      const directionAngles = { E: 0, NE: 45, N: 90, NW: 135, W: 180, SW: 225, S: 270, SE: 315 };
+
+      let dirs;
+      if (args.directions?.length) {
+        dirs = args.directions.map(d => d.toUpperCase());
+      } else {
+        const count = args.count === 8 ? 8 : 4;
+        dirs = count === 8 ? ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'] : ['N', 'E', 'S', 'W'];
+      }
+
+      // Fetch map and find center
+      let mapData;
+      try { mapData = await fetchJson(mapUrl); }
+      catch (e) { return { error: `Failed to fetch map: ${e.message}` }; }
+
+      const allTiles = Object.values(mapData.tiles || {});
+      const walkable = allTiles.filter(t => t.walkable);
+      const dist2d = (t, cx, cz) => Math.sqrt((t.x - cx) ** 2 + (t.z - cz) ** 2);
+
+      let center;
+      if (args.centerTileId != null) {
+        center = walkable.find(t => t.id === args.centerTileId);
+        if (!center) return { error: `Center tile ${args.centerTileId} not found` };
+      } else {
+        center = walkable.reduce((best, t) => dist2d(t, 0, 0) < dist2d(best, 0, 0) ? t : best);
+      }
+      const cx = center.x, cz = center.z;
+
+      // Assign frequencies: base, base*1.25, base*1.5, base*2, ...
+      const baseFreq = args.baseFreq ?? 220;
+      const freqMultipliers = [1, 1.25, 1.5, 2, 2.5, 3, 4, 5];
+
+      const ringResults = [];
+
+      for (let i = 0; i < dirs.length; i++) {
+        const dir = dirs[i];
+        const angleDeg = directionAngles[dir] ?? (parseFloat(dir) || 0);
+        const angleRad = (angleDeg * Math.PI) / 180;
+        const sectorRad = (45 * Math.PI) / 180;
+        const freq = Math.round(baseFreq * (freqMultipliers[i] ?? (i + 1)));
+        const botName = `${prefix}-${dir.toLowerCase()}`;
+
+        // Find nearest walkable tile in this sector at target distance
+        const inSector = walkable.filter(t => {
+          const dx = t.x - cx, dz = -(t.z - cz);
+          const angle = Math.atan2(dz, dx);
+          let diff = angle - angleRad;
+          while (diff > Math.PI) diff -= 2 * Math.PI;
+          while (diff < -Math.PI) diff += 2 * Math.PI;
+          return Math.abs(diff) <= sectorRad;
+        });
+        const pool = inSector.length > 0 ? inSector : walkable;
+        const best = pool.reduce((b, t) => {
+          const da = Math.abs(dist2d(t, cx, cz) - distance);
+          const db = Math.abs(dist2d(b, cx, cz) - distance);
+          return da < db ? t : b;
+        });
+        const actualDist = Math.round(dist2d(best, cx, cz) * 100) / 100;
+
+        // Skip if bot already exists
+        if (bots.has(botName)) {
+          ringResults.push({ name: botName, direction: dir, tileId: best.id, actualDist, freq, status: 'skipped' });
+          continue;
+        }
+
+        try {
+          const bot = new BotConnection(wsUrl, botName, '', {});
+          await bot.connect();
+          bots.set(botName, bot);
+          await sleep(300);
+          bot.moveToTile(best.id);
+          await sleep(200);
+          bot._send({ h: 'voiceState', a: [true] });
+
+          if (startAudio) {
+            await sleep(500);
+            // Derive room ID
+            const urlObj = new URL(wsUrl);
+            const worldPath = urlObj.pathname.replace(/^\/socket\//, '').replace(/\/$/, '') || '0,0';
+            const roomId = `${urlObj.hostname}@${worldPath}`;
+            const session = new BotRTCSession(botName, roomId, `https://${urlObj.hostname}`, freq, gain);
+            await session.start(freq, gain);
+            rtcSessions.set(botName, session);
+          }
+
+          ringResults.push({ name: botName, direction: dir, tileId: best.id, actualDist, freq, gain, status: 'ready', audioStarted: startAudio });
+        } catch (err) {
+          const b = bots.get(botName);
+          if (b) { b.close(); bots.delete(botName); }
+          ringResults.push({ name: botName, direction: dir, tileId: best.id, actualDist, freq, status: 'failed', error: err.message });
+        }
+
+        if (i < dirs.length - 1) await sleep(600);
+      }
+
+      return {
+        centerTile: { id: center.id, x: Math.round(cx * 10) / 10, z: Math.round(cz * 10) / 10 },
+        distance,
+        directions: dirs,
+        bots: ringResults,
+        tip: `Stand on tile ${center.id} (world center), enter FPP, and rotate. Each direction has a distinct tone: ${dirs.map((d, i) => `${d}=${Math.round(baseFreq * (freqMultipliers[i] ?? (i+1)))}Hz`).join(', ')}. You should hear clear left/right/front/behind panning.`,
+      };
+    }
+
+    case 'bot_scene_audio': {
+      const action = args.action || 'setup';
+      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+
+      if (action === 'teardown') {
+        // Stop conductor
+        if (conductorInterval) { clearInterval(conductorInterval); conductorInterval = null; }
+        if (conductorBot) { const n = conductorBot.username; conductorBot.close(); bots.delete(n); conductorBot = null; }
+        // Stop all audio sessions
+        for (const [n, s] of rtcSessions) { try { s.stop(); } catch (_) {} }
+        rtcSessions.clear();
+        // Kill all bots
+        for (const [n, b] of bots) b.close();
+        bots.clear();
+        return { status: 'teardown_complete' };
+      }
+
+      if (action === 'status') {
+        const audioStatus = [];
+        for (const [n, s] of rtcSessions) audioStatus.push(s.getState());
+        return {
+          bots: [...bots.entries()].map(([n, b]) => ({ name: n, connected: b.connected, tile: b.ownTile })),
+          audioSessions: audioStatus,
+          conductor: conductorBot ? { name: conductorBot.username, connected: conductorBot.connected } : null,
+          config: conductorConfig,
+        };
+      }
+
+      if (action === 'setup_ring') {
+        // Teardown first
+        if (conductorInterval) { clearInterval(conductorInterval); conductorInterval = null; }
+        if (conductorBot) { const n = conductorBot.username; conductorBot.close(); bots.delete(n); conductorBot = null; }
+        for (const [n, s] of rtcSessions) { try { s.stop(); } catch (_) {} }
+        rtcSessions.clear();
+        for (const [n, b] of bots) b.close();
+        bots.clear();
+        await sleep(500);
+
+        // Set up directional ring (N/E/S/W at 10u)
+        const ringResult = await handleTool('bot_directional_ring', { wsUrl, distance: 10, count: 4, baseFreq: 220, gain: 0.7, startAudio: true });
+
+        // Start conductor
+        await sleep(500);
+        const condResult = await handleTool('bot_conductor_start', { wsUrl, username: 'conductor' });
+
+        return { action: 'setup_ring', ring: ringResult, conductor: condResult };
+      }
+
+      // Default: 'setup' — distance-based test
+      if (conductorInterval) { clearInterval(conductorInterval); conductorInterval = null; }
+      if (conductorBot) { const n = conductorBot.username; conductorBot.close(); bots.delete(n); conductorBot = null; }
+      for (const [n, s] of rtcSessions) { try { s.stop(); } catch (_) {} }
+      rtcSessions.clear();
+      for (const [n, b] of bots) b.close();
+      bots.clear();
+      await sleep(500);
+
+      const distanceBots = [
+        { name: 'audio-5u',  tileId: 1950, freq: 220, gain: 0.6 },
+        { name: 'audio-10u', tileId: 1763, freq: 330, gain: 0.6 },
+        { name: 'audio-20u', tileId: 1498, freq: 440, gain: 0.6 },
+        { name: 'audio-30u', tileId: 1257, freq: 550, gain: 0.6 },
+      ];
+      const setupResults = [];
+      const urlObj = new URL(wsUrl);
+      const worldPath = urlObj.pathname.replace(/^\/socket\//, '').replace(/\/$/, '') || '0,0';
+      const roomId = `${urlObj.hostname}@${worldPath}`;
+      const voiceServerBase = `https://${urlObj.hostname}`;
+
+      for (const cfg of distanceBots) {
+        try {
+          const bot = new BotConnection(wsUrl, cfg.name, '', {});
+          await bot.connect();
+          bots.set(cfg.name, bot);
+          await sleep(300);
+          bot.moveToTile(cfg.tileId);
+          await sleep(200);
+          bot._send({ h: 'voiceState', a: [true] });
+          await sleep(500);
+          const session = new BotRTCSession(cfg.name, roomId, voiceServerBase, cfg.freq, cfg.gain);
+          await session.start(cfg.freq, cfg.gain);
+          rtcSessions.set(cfg.name, session);
+          setupResults.push({ name: cfg.name, tileId: cfg.tileId, freq: cfg.freq, status: 'ready' });
+        } catch (err) {
+          setupResults.push({ name: cfg.name, status: 'failed', error: err.message });
+        }
+        await sleep(500);
+      }
+
+      await sleep(300);
+      const condResult = await handleTool('bot_conductor_start', { wsUrl, username: 'conductor' });
+
+      return {
+        action: 'setup',
+        bots: setupResults,
+        conductor: condResult,
+        tip: 'Distance test ready. Enter FPP at world center and walk toward/away from bots. Chat: !ref N  !rolloff N  !vol N  !status  !reset',
+      };
     }
 
     case 'bot_push_config': {
