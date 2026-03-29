@@ -57,7 +57,7 @@ function fetchJson(url) {
 }
 
 // Exponential falloff gain: (refDistance / max(refDistance, d))^rolloffFactor
-function spatialGain(d, refDistance = 5, rolloffFactor = 0.75) {
+function spatialGain(d, refDistance = 1, rolloffFactor = 0.75) {
   if (d <= 0) return 1;
   return Math.pow(refDistance / Math.max(refDistance, d), rolloffFactor);
 }
@@ -1376,7 +1376,7 @@ async function handleTool(name, args) {
       return {
         centerTile: { id: center.id, x: Math.round(cx * 10) / 10, z: Math.round(cz * 10) / 10 },
         tiles: results,
-        note: showFalloff ? 'Gain/dB based on exponential model, refDistance=5, rolloffFactor=0.75 (current Config.json defaults)' : undefined,
+        note: showFalloff ? 'Gain/dB based on FPP exponential model: refDistance=1, rolloffFactor=0.75. Isometric uses global audio (no falloff).' : undefined,
         spatialGridArgs: {
           tiles: results.map(r => ({ tileId: r.tileId, label: r.label })),
         },
