@@ -278,6 +278,16 @@ class BotConnection extends EventEmitter {
         break;
       }
 
+      case 'voiceState': {
+        const vsData = msg.a?.[0];
+        if (vsData && vsData.id != null) {
+          const user = this.knownUsers.get(String(vsData.id));
+          if (user) user.voiceState = vsData.state ?? false;
+        }
+        this._bufferEvent('voiceState', vsData);
+        break;
+      }
+
       case 'emote': {
         const [userId, animation] = msg.a || [];
         this._bufferEvent('emote', { userId, animation });
@@ -678,6 +688,43 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: 'bot_spatial_grid',
+    description: 'Spatial audio test tool. Spawns bots at specified tiles, activates their voice indicators, and reports positions. Use this to create a grid of "speakers" at known distances so you can walk through the world and tune spatial audio falloff.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tiles: {
+          type: 'array',
+          description: 'Array of tile placements. Each entry has a tileId and optional label.',
+          items: {
+            type: 'object',
+            properties: {
+              tileId: { type: 'number', description: 'Tile ID to place the bot at' },
+              label: { type: 'string', description: 'Human-readable label (e.g. "near", "mid", "far")' },
+            },
+            required: ['tileId'],
+          },
+        },
+        prefix: { type: 'string', description: 'Bot name prefix (default: "audio")' },
+        wsUrl: { type: 'string', description: `WebSocket URL (default: ${DEFAULT_WS_URL})` },
+        voiceOn: { type: 'boolean', description: 'Activate voice indicator on all bots (default: true)' },
+        staggerMs: { type: 'number', description: 'Delay between spawns in ms (default: 400)' },
+      },
+      required: ['tiles'],
+    },
+  },
+  {
+    name: 'bot_voice_all',
+    description: 'Toggle voice state on all currently active bots at once.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        state: { type: 'boolean', description: 'true = mic on, false = mic off' },
+      },
+      required: ['state'],
+    },
+  },
 ];
 
 // --- Tool Handlers ---
@@ -1039,6 +1086,69 @@ async function handleTool(name, args) {
           avgLatencyMs: latencyCount > 0 ? Math.round(latencySum / latencyCount) : null,
         },
       };
+    }
+
+    case 'bot_spatial_grid': {
+      const prefix = args.prefix || 'audio';
+      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const voiceOn = args.voiceOn !== false;
+      const staggerMs = args.staggerMs ?? 400;
+      const tiles = args.tiles || [];
+      const results = [];
+
+      for (let i = 0; i < tiles.length; i++) {
+        const { tileId, label } = tiles[i];
+        const botName = `${prefix}-${label || i}`;
+
+        if (bots.has(botName)) {
+          results.push({ name: botName, tileId, label: label || String(i), status: 'skipped', error: 'already exists' });
+          continue;
+        }
+
+        const bot = new BotConnection(wsUrl, botName, '', {});
+        try {
+          await bot.connect();
+          bots.set(botName, bot);
+          await sleep(300);
+          bot.moveToTile(tileId);
+          bot.ownTile = tileId;
+          await sleep(200);
+          if (voiceOn) bot._send({ h: 'voiceState', a: [true] });
+          results.push({
+            name: botName,
+            tileId,
+            label: label || String(i),
+            status: 'ready',
+            voiceOn,
+            position: bot.ownPosition || null,
+          });
+        } catch (err) {
+          bot.close();
+          bots.delete(botName);
+          results.push({ name: botName, tileId, label: label || String(i), status: 'failed', error: err.message });
+        }
+
+        if (i < tiles.length - 1 && staggerMs > 0) await sleep(staggerMs);
+      }
+
+      const ready = results.filter(r => r.status === 'ready').length;
+      return {
+        summary: { ready, failed: results.filter(r => r.status === 'failed').length, skipped: results.filter(r => r.status === 'skipped').length },
+        bots: results,
+        tip: 'Walk through the world to test spatial audio falloff. Use bot_voice_all to toggle voice on/off. Use bot_close_all when done.',
+      };
+    }
+
+    case 'bot_voice_all': {
+      const state = args.state;
+      const updated = [];
+      for (const [n, bot] of bots) {
+        if (bot.connected) {
+          bot._send({ h: 'voiceState', a: [state] });
+          updated.push(n);
+        }
+      }
+      return { status: 'voice_set', state, updated, count: updated.length };
     }
 
     default:
