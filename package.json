@@ -8,6 +8,9 @@
     "start": "node bot-mcp.mjs"
   },
   "dependencies": {
+    "@roamhq/wrtc": "^0.10.0",
+    "mediasoup-client": "^3.18.7",
+    "socket.io-client": "^4.8.3",
     "ws": "^8.18.0"
   }
 }

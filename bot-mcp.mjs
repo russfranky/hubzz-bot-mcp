@@ -12,6 +12,18 @@
 import WebSocket from 'ws';
 import { EventEmitter } from 'events';
 import https from 'https';
+import wrtcPkg from '@roamhq/wrtc';
+import { Device } from 'mediasoup-client';
+import { io } from 'socket.io-client';
+
+// Polyfill WebRTC globals for mediasoup-client (Node.js)
+const { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, MediaStream, MediaStreamTrack, nonstandard } = wrtcPkg;
+const { RTCAudioSource } = nonstandard;
+globalThis.RTCPeerConnection = RTCPeerConnection;
+globalThis.RTCSessionDescription = RTCSessionDescription;
+globalThis.RTCIceCandidate = RTCIceCandidate;
+globalThis.MediaStream = MediaStream;
+globalThis.MediaStreamTrack = MediaStreamTrack;
 
 // --- Configuration ---
 
@@ -463,6 +475,149 @@ class BotConnection extends EventEmitter {
 // --- Bot Manager ---
 
 const bots = new Map();
+const rtcSessions = new Map();
+
+// --- Bot RTC Session (mediasoup audio production) ---
+
+const RTC_SERVER = 'https://demo.hubzz.com/';
+const AUDIO_SAMPLE_RATE = 48000;
+const AUDIO_FRAME_SIZE = 480; // 10ms at 48kHz
+
+class BotRTCSession {
+  constructor(botName, roomId) {
+    this.botName = botName;
+    this.roomId = roomId;
+    this.socket = null;
+    this.device = null;
+    this.sendTransport = null;
+    this.producer = null;
+    this.audioSource = null;
+    this.toneTimer = null;
+    this.phase = 0;
+    this.frequency = 440;
+    this.gain = 0.5;
+    this.status = 'idle';
+    this.error = null;
+  }
+
+  socketRequest(type, data = {}) {
+    return new Promise((resolve, reject) => {
+      this.socket.emit(type, data, (res) => {
+        if (res?.error) reject(new Error(typeof res.error === 'string' ? res.error : JSON.stringify(res.error)));
+        else resolve(res);
+      });
+    });
+  }
+
+  async start(frequency = 440, gain = 0.5) {
+    this.frequency = frequency;
+    this.gain = gain;
+    this.status = 'connecting';
+
+    this.socket = io(RTC_SERVER, { transports: ['websocket'] });
+    await new Promise((resolve, reject) => {
+      this.socket.on('connect', resolve);
+      this.socket.on('connect_error', e => reject(new Error(`Socket.IO connect error: ${e.message}`)));
+      setTimeout(() => reject(new Error('Socket.IO connection timed out')), 8000);
+    });
+
+    await this.socketRequest('join', {
+      name: this.botName,
+      room_id: this.roomId,
+      token: crypto.randomUUID(),
+      user_id: -1,
+    });
+
+    const routerRtpCapabilities = await this.socketRequest('getRouterRtpCapabilities');
+    this.device = await Device.factory({ handlerName: 'Chrome111' });
+    await this.device.load({ routerRtpCapabilities });
+
+    if (!this.device.canProduce('audio')) throw new Error('Router does not support audio production');
+
+    const transportData = await this.socketRequest('createWebRtcTransport', {
+      forceTcp: false,
+      rtpCapabilities: this.device.rtpCapabilities,
+    });
+
+    this.sendTransport = this.device.createSendTransport({
+      id: transportData.id,
+      iceParameters: transportData.iceParameters,
+      iceCandidates: transportData.iceCandidates,
+      dtlsParameters: transportData.dtlsParameters,
+      sctpParameters: transportData.sctpParameters,
+    });
+
+    this.sendTransport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+      try {
+        await this.socketRequest('connectTransport', { dtlsParameters, transport_id: this.sendTransport.id });
+        callback();
+      } catch (e) { errback(e); }
+    });
+
+    this.sendTransport.on('produce', async ({ kind, rtpParameters }, callback, errback) => {
+      try {
+        const { producer_id } = await this.socketRequest('produce', {
+          producerTransportId: this.sendTransport.id,
+          kind,
+          rtpParameters,
+        });
+        callback({ id: producer_id });
+      } catch (e) { errback(e); }
+    });
+
+    // Create audio source and start tone
+    this.audioSource = new RTCAudioSource();
+    const track = this.audioSource.createTrack();
+    this.producer = await this.sendTransport.produce({ track });
+    this._startTone();
+
+    this.status = 'producing';
+    return { producerId: this.producer.id, transportId: this.sendTransport.id };
+  }
+
+  _startTone() {
+    const samplesPerFrame = AUDIO_FRAME_SIZE;
+    this.toneTimer = setInterval(() => {
+      const samples = new Int16Array(samplesPerFrame);
+      for (let i = 0; i < samplesPerFrame; i++) {
+        samples[i] = Math.round(Math.sin(this.phase) * 32767 * this.gain);
+        this.phase += (2 * Math.PI * this.frequency) / AUDIO_SAMPLE_RATE;
+        if (this.phase > 2 * Math.PI) this.phase -= 2 * Math.PI;
+      }
+      this.audioSource.onData({
+        samples,
+        sampleRate: AUDIO_SAMPLE_RATE,
+        bitsPerSample: 16,
+        channelCount: 1,
+        numberOfFrames: samplesPerFrame,
+      });
+    }, 10);
+  }
+
+  setTone(frequency, gain) {
+    if (frequency != null) this.frequency = frequency;
+    if (gain != null) this.gain = Math.max(0, Math.min(1, gain));
+  }
+
+  stop() {
+    if (this.toneTimer) { clearInterval(this.toneTimer); this.toneTimer = null; }
+    if (this.producer) { try { this.producer.close(); } catch (_) {} this.producer = null; }
+    if (this.sendTransport) { try { this.sendTransport.close(); } catch (_) {} this.sendTransport = null; }
+    if (this.socket) { this.socket.disconnect(); this.socket = null; }
+    this.status = 'stopped';
+  }
+
+  getState() {
+    return {
+      botName: this.botName,
+      roomId: this.roomId,
+      status: this.status,
+      frequency: this.frequency,
+      gain: this.gain,
+      producerId: this.producer?.id || null,
+    };
+  }
+}
 
 // --- MCP Protocol (stdio JSON-RPC) ---
 
@@ -758,6 +913,54 @@ const TOOLS = [
         state: { type: 'boolean', description: 'true = mic on, false = mic off' },
       },
       required: ['state'],
+    },
+  },
+  {
+    name: 'bot_audio_start',
+    description: 'Connect a bot to the mediasoup RTC server and start producing a sine wave tone. Other users in the world will hear real spatial audio from the bot\'s position. Use this to physically test spatial audio falloff.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name (must already be spawned)' },
+        frequency: { type: 'number', description: 'Tone frequency in Hz (default: 440). Use different freqs per bot to distinguish them.' },
+        gain: { type: 'number', description: 'Volume gain 0.0–1.0 (default: 0.5)' },
+        wsUrl: { type: 'string', description: `WebSocket URL to derive room ID from (default: ${DEFAULT_WS_URL})` },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_audio_stop',
+    description: 'Stop a bot\'s audio production and disconnect from the RTC server.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_audio_tune',
+    description: 'Change a bot\'s tone frequency or gain while it\'s producing audio. Use this to hot-swap tones during a spatial audio test.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        frequency: { type: 'number', description: 'New frequency in Hz' },
+        gain: { type: 'number', description: 'New gain 0.0–1.0' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_audio_status',
+    description: 'Get the RTC audio status of one or all bots.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name (omit for all)' },
+      },
     },
   },
 ];
@@ -1241,6 +1444,62 @@ async function handleTool(name, args) {
         }
       }
       return { status: 'voice_set', state, updated, count: updated.length };
+    }
+
+    case 'bot_audio_start': {
+      const botName = args.name;
+      if (rtcSessions.has(botName)) return { error: `Bot "${botName}" already has an active audio session. Use bot_audio_stop first.` };
+
+      // Derive room_id from wsUrl: wss://hubzz.xyz/socket/0,0/ → hubzz.xyz@0,0
+      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const urlObj = new URL(wsUrl);
+      const hostname = urlObj.hostname;
+      const worldPath = urlObj.pathname.replace(/^\/socket\//, '').replace(/\/$/, '') || '0,0';
+      const roomId = `${hostname}@${worldPath}`;
+
+      const session = new BotRTCSession(botName, roomId);
+      rtcSessions.set(botName, session);
+
+      try {
+        const result = await session.start(args.frequency || 440, args.gain ?? 0.5);
+        // Also set voiceState on the game bot if it exists
+        const gameBot = bots.get(botName);
+        if (gameBot?.connected) gameBot._send({ h: 'voiceState', a: [true] });
+        return { status: 'producing', botName, roomId, frequency: session.frequency, gain: session.gain, ...result };
+      } catch (err) {
+        session.stop();
+        rtcSessions.delete(botName);
+        return { error: `Failed to start audio: ${err.message}` };
+      }
+    }
+
+    case 'bot_audio_stop': {
+      const session = rtcSessions.get(args.name);
+      if (!session) return { error: `No active audio session for bot "${args.name}"` };
+      session.stop();
+      rtcSessions.delete(args.name);
+      // Turn off voiceState on game bot
+      const gameBot = bots.get(args.name);
+      if (gameBot?.connected) gameBot._send({ h: 'voiceState', a: [false] });
+      return { status: 'stopped', name: args.name };
+    }
+
+    case 'bot_audio_tune': {
+      const session = rtcSessions.get(args.name);
+      if (!session) return { error: `No active audio session for bot "${args.name}"` };
+      session.setTone(args.frequency, args.gain);
+      return { status: 'updated', name: args.name, frequency: session.frequency, gain: session.gain };
+    }
+
+    case 'bot_audio_status': {
+      if (args.name) {
+        const session = rtcSessions.get(args.name);
+        if (!session) return { name: args.name, status: 'no_session' };
+        return session.getState();
+      }
+      const all = [];
+      for (const [, s] of rtcSessions) all.push(s.getState());
+      return { sessions: all, count: all.length };
     }
 
     default:
