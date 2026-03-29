@@ -11,6 +11,7 @@
 
 import WebSocket from 'ws';
 import { EventEmitter } from 'events';
+import https from 'https';
 
 // --- Configuration ---
 
@@ -32,6 +33,22 @@ const AVAILABLE_EMOTES = [
 ];
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+    }).on('error', reject);
+  });
+}
+
+// Exponential falloff gain: (refDistance / max(refDistance, d))^rolloffFactor
+function spatialGain(d, refDistance = 5, rolloffFactor = 0.75) {
+  if (d <= 0) return 1;
+  return Math.pow(refDistance / Math.max(refDistance, d), rolloffFactor);
+}
 
 // --- Bot Connection ---
 
@@ -689,6 +706,24 @@ const TOOLS = [
     },
   },
   {
+    name: 'bot_find_tiles',
+    description: 'Fetch the world map and find walkable tiles at specified distances from a reference tile (or world origin). Returns a tiles array ready to pass to bot_spatial_grid.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        distances: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Target distances in world units (e.g. [5, 10, 20, 30, 50])',
+        },
+        centerTileId: { type: 'number', description: 'Reference tile ID to measure from (default: nearest walkable tile to world origin)' },
+        mapUrl: { type: 'string', description: 'Map JSON URL (default: https://hubzz.xyz/data/maps/world_2.json)' },
+        showFalloff: { type: 'boolean', description: 'Include predicted volume falloff based on current spatial audio config (default: true)' },
+      },
+      required: ['distances'],
+    },
+  },
+  {
     name: 'bot_spatial_grid',
     description: 'Spatial audio test tool. Spawns bots at specified tiles, activates their voice indicators, and reports positions. Use this to create a grid of "speakers" at known distances so you can walk through the world and tune spatial audio falloff.',
     inputSchema: {
@@ -1084,6 +1119,63 @@ async function handleTool(name, args) {
           totalMessagesReceived: totalReceived,
           totalErrors,
           avgLatencyMs: latencyCount > 0 ? Math.round(latencySum / latencyCount) : null,
+        },
+      };
+    }
+
+    case 'bot_find_tiles': {
+      const mapUrl = args.mapUrl || 'https://hubzz.xyz/data/maps/world_2.json';
+      const showFalloff = args.showFalloff !== false;
+      const distances = args.distances || [];
+
+      let mapData;
+      try { mapData = await fetchJson(mapUrl); }
+      catch (e) { return { error: `Failed to fetch map: ${e.message}` }; }
+
+      const allTiles = Object.values(mapData.tiles || {});
+      const walkable = allTiles.filter(t => t.walkable);
+
+      const dist2d = (t, cx, cz) => Math.sqrt((t.x - cx) ** 2 + (t.z - cz) ** 2);
+
+      // Find center tile
+      let center;
+      if (args.centerTileId != null) {
+        center = walkable.find(t => t.id === args.centerTileId);
+        if (!center) return { error: `Tile ${args.centerTileId} not found or not walkable` };
+      } else {
+        center = walkable.reduce((best, t) => dist2d(t, 0, 0) < dist2d(best, 0, 0) ? t : best);
+      }
+
+      const cx = center.x, cz = center.z;
+      const results = [];
+
+      for (const targetDist of distances) {
+        const best = walkable.reduce((b, t) => {
+          const da = Math.abs(dist2d(t, cx, cz) - targetDist);
+          const db = Math.abs(dist2d(b, cx, cz) - targetDist);
+          return da < db ? t : b;
+        });
+        const actual = dist2d(best, cx, cz);
+        const entry = {
+          tileId: best.id,
+          label: `${targetDist}u`,
+          targetDistance: targetDist,
+          actualDistance: Math.round(actual * 100) / 100,
+          position: { x: Math.round(best.x * 10) / 10, z: Math.round(best.z * 10) / 10 },
+        };
+        if (showFalloff) {
+          entry.predictedGain = Math.round(spatialGain(actual) * 1000) / 1000;
+          entry.predictedDb = Math.round(20 * Math.log10(Math.max(spatialGain(actual), 0.001)) * 10) / 10;
+        }
+        results.push(entry);
+      }
+
+      return {
+        centerTile: { id: center.id, x: Math.round(cx * 10) / 10, z: Math.round(cz * 10) / 10 },
+        tiles: results,
+        note: showFalloff ? 'Gain/dB based on exponential model, refDistance=5, rolloffFactor=0.75 (current Config.json defaults)' : undefined,
+        spatialGridArgs: {
+          tiles: results.map(r => ({ tileId: r.tileId, label: r.label })),
         },
       };
     }
