@@ -19,11 +19,20 @@ The MCP server is registered in Claude Code's MCP config and runs as a backgroun
 
 ## Tool Reference
 
+### Testing & Assertions
+| Tool | Description |
+|------|-------------|
+| `bot_watch_events` | Wait for a specific event type with optional field matcher and timeout. Returns matched event data. |
+| `bot_world_wait` | Wait for a world-level condition: user_joined, user_left, chat_received, entity_added, entity_removed, notice_received, user_count_gte/lte |
+| `bot_assert` | Assert bot state matches expectations. Checks: connected, user_present/absent, user_at_tile, own_tile, chat_contains, notice_contains, user_count, entity_present/absent |
+| `bot_ping_latency` | Measure WebSocket ping latency — returns min/avg/max/p50/p95 over N samples |
+
 ### Bot Lifecycle
 | Tool | Description |
 |------|-------------|
-| `bot_spawn` | Connect a bot to a world |
+| `bot_spawn` | Connect a bot to a world (authenticated, iamar0b0t token) |
 | `bot_spawn_at` | Spawn + move to tile in one call |
+| `bot_guest` | Spawn a guest bot (login_guest — gets GuestXXX username, spectator UI) |
 | `bot_close` | Disconnect a bot |
 | `bot_close_all` | Kill all bots |
 | `bot_list` | List all active bots and status |
@@ -34,11 +43,18 @@ The MCP server is registered in Claude Code's MCP config and runs as a backgroun
 |------|-------------|
 | `bot_move` | Move bot to a tile ID |
 | `bot_patrol` | Walk a tile route on a timer (loops) |
+| `bot_kbs` | Send keyboard-sync position update (smooth movement, distinct from tile-based w:move) |
+| `bot_rotate` | Set avatar rotation by yaw degrees or full {x,y,z} Euler radians |
 | `bot_chat` | Send a chat message |
-| `bot_dance` | Play any animation |
-| `bot_emote` | Legacy animation (use bot_dance) |
+| `bot_typing` | Send typing indicator with optional auto-clear |
+| `bot_dance` | Play any animation (one-shot) |
+| `bot_emote_loop` | Play looping animation (sit, idle, waiting) — persists until stopped |
+| `bot_emote` | Legacy one-shot animation (use bot_dance) |
 | `bot_set_avatar` | Change VRM or shuffle avatar |
 | `bot_nick` | Change display name via !nick |
+| `bot_screen` | Control screen entity — play URL, stop, or raw entity call |
+| `bot_upload` | Send a test file upload through the WebSocket |
+| `bot_kick_test` | Send moderation command (!kick/!ban/!grant) from a privileged bot |
 
 ### Observation
 | Tool | Description |

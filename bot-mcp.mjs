@@ -70,6 +70,7 @@ class BotConnection extends EventEmitter {
     this.wsUrl = wsUrl;
     this.username = username;
     this.vrmUrl = vrmUrl;
+    this.isGuest = opts.isGuest || false;
     this.ws = null;
     this.connected = false;
     this.intentionallyClosed = false;
@@ -133,7 +134,11 @@ class BotConnection extends EventEmitter {
       }, 10000);
 
       this.ws.on('open', () => {
-        this._send({ h: 'login', a: ['iamar0b0t', this.username, this.vrmUrl] });
+        if (this.isGuest) {
+          this._send({ h: 'login_guest', a: [] });
+        } else {
+          this._send({ h: 'login', a: ['iamar0b0t', this.username, this.vrmUrl] });
+        }
       });
 
       this.ws.on('message', (data) => {
@@ -332,10 +337,41 @@ class BotConnection extends EventEmitter {
   }
 
   _bufferEvent(type, data) {
+    // Always emit for waitForEvent listeners
+    this.emit('_event', { type, data });
+    this.emit(type, data);
+    // Only store in buffer if subscribed
     if (this.eventSubscriptions.has('*') || this.eventSubscriptions.has(type)) {
       this.eventBuffer.push({ type, data, timestamp: Date.now() });
       if (this.eventBuffer.length > MAX_EVENT_BUFFER) this.eventBuffer.shift();
     }
+  }
+
+  waitForEvent(type, matchFn = null, timeoutMs = 5000) {
+    return new Promise((resolve, reject) => {
+      let off;
+      const timer = setTimeout(() => {
+        off?.();
+        reject(new Error(`Timeout: no "${type}" event within ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      const handler = (data) => {
+        if (!matchFn || matchFn(data)) {
+          clearTimeout(timer);
+          off?.();
+          resolve({ type, data, timestamp: Date.now() });
+        }
+      };
+
+      if (type === '*') {
+        const anyHandler = (ev) => handler(ev.data);
+        this.on('_event', anyHandler);
+        off = () => this.removeListener('_event', anyHandler);
+      } else {
+        this.on(type, handler);
+        off = () => this.removeListener(type, handler);
+      }
+    });
   }
 
   _trackError(type, detail) {
@@ -971,6 +1007,200 @@ const TOOLS = [
       properties: {
         name: { type: 'string', description: 'Bot name (omit for all)' },
       },
+    },
+  },
+  {
+    name: 'bot_typing',
+    description: 'Make a bot send a typing indicator (shows the "..." bubble). Optionally auto-clears after a delay.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        typing: { type: 'boolean', description: 'true = start typing, false = stop (default: true)' },
+        autoClearMs: { type: 'number', description: 'Auto-send stop after N ms (optional, e.g. 1500)' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_rotate',
+    description: 'Set a bot\'s avatar rotation. Use yaw (Y-axis degrees) for simple left/right facing, or supply full {x,y,z} Euler angles.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        yaw: { type: 'number', description: 'Horizontal rotation in degrees (0=forward, 90=left, 180=back, 270=right). Shorthand for y only.' },
+        x: { type: 'number', description: 'X rotation in radians (pitch)' },
+        y: { type: 'number', description: 'Y rotation in radians (yaw)' },
+        z: { type: 'number', description: 'Z rotation in radians (roll)' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_emote_loop',
+    description: 'Play a looping animation on a bot (e.g. sit, idle, waiting). Unlike bot_dance, this uses the emote message with loop=true so the animation persists until explicitly stopped.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        animation: { type: 'string', description: 'Animation name (e.g. anim_sit, anim_idle, emotion_6_waiting)' },
+        loop: { type: 'boolean', description: 'true = loop, false = play once and stop (default: true)' },
+      },
+      required: ['name', 'animation'],
+    },
+  },
+  {
+    name: 'bot_guest',
+    description: 'Spawn a guest (unauthenticated) bot using login_guest. Guests get a GuestXXX username, cannot chat, and see the spectator/guest UI. Use this to test guest-specific flows.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Internal manager name (not sent to server — guest gets assigned GuestXXX)' },
+        wsUrl: { type: 'string', description: `WebSocket URL (default: ${DEFAULT_WS_URL})` },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_kick_test',
+    description: 'Send a moderation command (!kick, !ban, !grant) from a bot that has moderator/admin permissions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name (must have mod/admin permissions)' },
+        action: { type: 'string', enum: ['kick', 'ban', 'grant'], description: 'Moderation action' },
+        target: { type: 'string', description: 'Target username' },
+        duration: { type: 'number', description: 'Ban duration in minutes (0 = permanent). Only for action=ban.' },
+        permission: { type: 'string', description: 'Permission to grant (e.g. command.moderate). Only for action=grant.' },
+      },
+      required: ['name', 'action', 'target'],
+    },
+  },
+  {
+    name: 'bot_watch_events',
+    description: 'Wait for a specific event from a bot with a timeout. Returns the matched event data. Useful for asserting server responses without polling.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name to watch' },
+        eventType: { type: 'string', description: 'Event type to wait for: chat, w:add, w:rem, w:move, notice, voiceState, emote, ts, disconnect, redirect, * (any)' },
+        matchField: { type: 'string', description: 'Optional dot-path field in event data to match (e.g. "username", "message")' },
+        matchValue: { description: 'Value that matchField must equal' },
+        timeoutMs: { type: 'number', description: 'Max wait time in ms (default: 5000)' },
+      },
+      required: ['name', 'eventType'],
+    },
+  },
+  {
+    name: 'bot_upload',
+    description: 'Send a test file upload through a bot\'s WebSocket connection. Tests the upload message handler. Defaults to a minimal 1×1 transparent PNG.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        filename: { type: 'string', description: 'Filename to send (default: test.png). Extension determines accepted type: png, jpg, webp, webm, mp4, gif, glb, mp3, wav, ogg.' },
+        data: { type: 'string', description: 'Base64-encoded file data (optional — defaults to a minimal valid test file for the given extension)' },
+        waitForResponse: { type: 'boolean', description: 'Wait for broadcast confirmation (default: true)' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_screen',
+    description: 'Control a screen entity in the world — play a URL, stop playback, or call any entity method.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        action: { type: 'string', enum: ['play', 'stop', 'call'], description: 'play = !play url, stop = !stop, call = raw entity call' },
+        url: { type: 'string', description: 'Video/media URL (required for play)' },
+        entityId: { type: 'string', description: 'Entity ID (required for call)' },
+        method: { type: 'string', description: 'Method name for call action' },
+        args: { type: 'array', description: 'Arguments for call action' },
+      },
+      required: ['name', 'action'],
+    },
+  },
+  {
+    name: 'bot_kbs',
+    description: 'Send a keyboard-sync (kbs) position update from a bot. This is the smooth continuous movement message used by the client during WASD movement — different from tile-based w:move.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        position: {
+          type: 'object',
+          description: 'World position {x, y, z}',
+          properties: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } },
+        },
+        rotation: {
+          type: 'object',
+          description: 'Rotation {x, y, z} in radians',
+          properties: { x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' } },
+        },
+        animation: { type: 'string', description: 'Animation name (e.g. anim_walk, anim_idle)' },
+      },
+      required: ['name', 'position'],
+    },
+  },
+  {
+    name: 'bot_world_wait',
+    description: 'Wait until a world-level condition is true, polling at 100ms intervals. Higher-level than bot_watch_events — expresses conditions in plain terms.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name to observe from' },
+        condition: {
+          type: 'string',
+          enum: ['user_joined', 'user_left', 'chat_received', 'entity_added', 'entity_removed', 'notice_received', 'user_count_gte', 'user_count_lte'],
+          description: 'Condition to wait for',
+        },
+        value: { description: 'Condition parameter: username for user_joined/left, substring for chat_received/notice_received, entity type for entity_added/removed, count for user_count_*' },
+        timeoutMs: { type: 'number', description: 'Max wait time in ms (default: 10000)' },
+      },
+      required: ['name', 'condition'],
+    },
+  },
+  {
+    name: 'bot_assert',
+    description: 'Assert that a bot\'s observed state matches expected values. Returns pass/fail with details. Use after actions to verify outcomes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        assertions: {
+          type: 'array',
+          description: 'List of assertions to check',
+          items: {
+            type: 'object',
+            properties: {
+              check: {
+                type: 'string',
+                enum: ['connected', 'user_present', 'user_absent', 'user_at_tile', 'own_tile', 'chat_contains', 'notice_contains', 'user_count', 'entity_present', 'entity_absent'],
+                description: 'What to check',
+              },
+              value: { description: 'Expected value (username, tile ID, message substring, count, entity type, etc.)' },
+              tileId: { type: 'number', description: 'For user_at_tile: expected tile ID' },
+            },
+            required: ['check'],
+          },
+        },
+      },
+      required: ['name', 'assertions'],
+    },
+  },
+  {
+    name: 'bot_ping_latency',
+    description: 'Measure WebSocket ping latency for a bot — returns min, avg, max over recent samples, or waits to collect fresh samples.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        samples: { type: 'number', description: 'Number of fresh ping samples to collect (0 = use existing, default: 0)' },
+        timeoutMs: { type: 'number', description: 'Max wait time when collecting fresh samples (default: 15000)' },
+      },
+      required: ['name'],
     },
   },
   {
@@ -1643,6 +1873,283 @@ async function handleTool(name, args) {
       const all = [];
       for (const [, s] of rtcSessions) all.push(s.getState());
       return { sessions: all, count: all.length };
+    }
+
+    case 'bot_typing': {
+      const r = getBot(args.name); if (r.error) return r;
+      const typing = args.typing !== false;
+      r.sendTypingStatus(typing);
+      if (typing && args.autoClearMs) {
+        setTimeout(() => { if (r.connected) r.sendTypingStatus(false); }, args.autoClearMs);
+      }
+      return { status: 'typing_sent', name: args.name, typing, autoClearMs: args.autoClearMs || null };
+    }
+
+    case 'bot_rotate': {
+      const r = getBot(args.name); if (r.error) return r;
+      let x = args.x ?? 0, y = args.y ?? 0, z = args.z ?? 0;
+      if (args.yaw != null) y = (args.yaw * Math.PI) / 180;
+      r.sendRotation(x, y, z);
+      r.ownRotation = { x, y, z };
+      return { status: 'rotated', name: args.name, rotation: { x, y, z }, yawDeg: args.yaw ?? null };
+    }
+
+    case 'bot_emote_loop': {
+      const r = getBot(args.name); if (r.error) return r;
+      const loop = args.loop !== false;
+      r._send({ h: 'emote', a: [args.animation, loop] });
+      return { status: 'emote_sent', name: args.name, animation: args.animation, loop };
+    }
+
+    case 'bot_guest': {
+      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const bot = new BotConnection(wsUrl, args.name, '', { isGuest: true });
+      try {
+        await bot.connect();
+        bots.set(args.name, bot);
+        // Guest username is assigned by server — read it from acc:ok data if possible
+        return { status: 'connected', name: args.name, isGuest: true, wsUrl };
+      } catch (err) {
+        bot.close();
+        return { error: err.message };
+      }
+    }
+
+    case 'bot_kick_test': {
+      const r = getBot(args.name); if (r.error) return r;
+      if (args.action === 'kick') {
+        r.sendChat(`!kick ${args.target}`);
+      } else if (args.action === 'ban') {
+        const dur = args.duration ?? 0;
+        r.sendChat(`!ban ${dur} ${args.target}`);
+      } else if (args.action === 'grant') {
+        if (!args.permission) return { error: 'permission required for grant action' };
+        r.sendChat(`!grant ${args.permission} ${args.target}`);
+      }
+      return { status: 'command_sent', action: args.action, target: args.target };
+    }
+
+    case 'bot_watch_events': {
+      const r = getBot(args.name); if (r.error) return r;
+      const timeoutMs = args.timeoutMs ?? 5000;
+      const eventType = args.eventType || '*';
+
+      let matchFn = null;
+      if (args.matchField != null && args.matchValue != null) {
+        const fieldPath = args.matchField.split('.');
+        matchFn = (data) => {
+          let val = data;
+          for (const key of fieldPath) val = val?.[key];
+          return String(val) === String(args.matchValue);
+        };
+      }
+
+      // Ensure subscribed so _bufferEvent fires
+      r.eventSubscriptions.add(eventType === '*' ? '*' : eventType);
+
+      try {
+        const result = await r.waitForEvent(eventType, matchFn, timeoutMs);
+        return { matched: true, event: result };
+      } catch (err) {
+        return { matched: false, error: err.message };
+      }
+    }
+
+    case 'bot_upload': {
+      const r = getBot(args.name); if (r.error) return r;
+      const filename = args.filename || 'test.png';
+      const ext = filename.split('.').pop().toLowerCase();
+
+      // Minimal valid test files as base64
+      const testFiles = {
+        png: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+        jpg: '/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AVIP/2Q==',
+        mp3: 'SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4LjI5LjEwMAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAACAAACcABgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBg//////////////////////////////////////////////////////////////////8AAAAATGF2YzU4LjU0AAAAAAAAAAAAAAAAJAAAAAAAAAAAAnABpMNLAAAAAAAAAAAAAAAAAAAA//tQZAAP8AAAaQAAAAgAAA0gAAABAAABpAAAACAAADSAAAAETEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV',
+      };
+      const data = args.data || testFiles[ext] || testFiles.png;
+      const replyGuid = crypto.randomUUID();
+
+      let responsePromise = null;
+      if (args.waitForResponse !== false) {
+        r.eventSubscriptions.add('w:call');
+        responsePromise = r.waitForEvent('w:call', null, 5000).catch(() => null);
+      }
+
+      r._send({ h: 'upload', a: [{ name: filename, data }, replyGuid] });
+
+      const response = responsePromise ? await responsePromise : null;
+      return { status: 'sent', filename, replyGuid, response: response?.data || null };
+    }
+
+    case 'bot_screen': {
+      const r = getBot(args.name); if (r.error) return r;
+      if (args.action === 'play') {
+        if (!args.url) return { error: 'url required for play action' };
+        r.sendChat(`!play ${args.url}`);
+        return { status: 'play_sent', url: args.url };
+      } else if (args.action === 'stop') {
+        r.sendChat('!stop');
+        return { status: 'stop_sent' };
+      } else if (args.action === 'call') {
+        if (!args.entityId || !args.method) return { error: 'entityId and method required for call action' };
+        r._send({ h: 'call', a: [args.entityId, args.method, ...(args.args || [])] });
+        return { status: 'call_sent', entityId: args.entityId, method: args.method };
+      }
+      return { error: `Unknown screen action: ${args.action}` };
+    }
+
+    case 'bot_kbs': {
+      const r = getBot(args.name); if (r.error) return r;
+      const pos = args.position;
+      const rot = args.rotation || { x: 0, y: 0, z: 0 };
+      const anim = args.animation || 'anim_idle';
+      r._send({ h: 'kbs', a: [pos, rot, anim] });
+      r.ownPosition = pos;
+      r.ownRotation = rot;
+      return { status: 'kbs_sent', position: pos, rotation: rot, animation: anim };
+    }
+
+    case 'bot_world_wait': {
+      const r = getBot(args.name); if (r.error) return r;
+      const timeoutMs = args.timeoutMs ?? 10000;
+      const condition = args.condition;
+      const value = args.value;
+      const deadline = Date.now() + timeoutMs;
+
+      const poll = () => new Promise((resolve, reject) => {
+        const check = () => {
+          let met = false;
+          let detail = null;
+          switch (condition) {
+            case 'user_joined': {
+              const found = [...r.knownUsers.values()].find(u => u.username === value || String(u.id) === String(value));
+              met = !!found; detail = found || null; break;
+            }
+            case 'user_left':
+              met = ![...r.knownUsers.values()].some(u => u.username === value || String(u.id) === String(value));
+              break;
+            case 'chat_received': {
+              const msg = r.chatBuffer.slice().reverse().find(m => !value || m.message.includes(value));
+              met = !!msg; detail = msg || null; break;
+            }
+            case 'notice_received': {
+              const n = r.notices.slice().reverse().find(n => !value || n.text?.includes(value));
+              met = !!n; detail = n || null; break;
+            }
+            case 'entity_added': {
+              const e = [...r.entities.values()].find(e => !value || e.type === value);
+              met = !!e; detail = e || null; break;
+            }
+            case 'entity_removed':
+              met = value ? ![...r.entities.values()].some(e => e.type === value) : r.entities.size === 0;
+              break;
+            case 'user_count_gte':
+              met = r.knownUsers.size >= Number(value); detail = { count: r.knownUsers.size }; break;
+            case 'user_count_lte':
+              met = r.knownUsers.size <= Number(value); detail = { count: r.knownUsers.size }; break;
+          }
+          if (met) { resolve({ condition, met: true, detail }); return; }
+          if (Date.now() >= deadline) { reject(new Error(`Timeout: condition "${condition}" not met within ${timeoutMs}ms`)); return; }
+          setTimeout(check, 100);
+        };
+        check();
+      });
+
+      try {
+        const result = await poll();
+        return result;
+      } catch (err) {
+        return { condition, met: false, error: err.message };
+      }
+    }
+
+    case 'bot_assert': {
+      const r = getBot(args.name); if (r.error) return r;
+      const results = [];
+
+      for (const assertion of (args.assertions || [])) {
+        const { check, value, tileId } = assertion;
+        let pass = false, actual = null, detail = null;
+
+        switch (check) {
+          case 'connected':
+            pass = r.connected; actual = r.connected; break;
+          case 'user_present': {
+            const u = [...r.knownUsers.values()].find(u => u.username === value || String(u.id) === String(value));
+            pass = !!u; actual = !!u; detail = u || null; break;
+          }
+          case 'user_absent':
+            pass = ![...r.knownUsers.values()].some(u => u.username === value || String(u.id) === String(value));
+            actual = !pass; break;
+          case 'user_at_tile': {
+            const u = [...r.knownUsers.values()].find(u => u.username === value || String(u.id) === String(value));
+            actual = u?.tile ?? null;
+            pass = u != null && Number(u.tile) === Number(tileId); break;
+          }
+          case 'own_tile':
+            actual = r.ownTile; pass = Number(r.ownTile) === Number(value); break;
+          case 'chat_contains': {
+            const msg = r.chatBuffer.slice().reverse().find(m => m.message.includes(value));
+            pass = !!msg; actual = msg?.message || null; break;
+          }
+          case 'notice_contains': {
+            const n = r.notices.slice().reverse().find(n => n.text?.includes(value));
+            pass = !!n; actual = n?.text || null; break;
+          }
+          case 'user_count':
+            actual = r.knownUsers.size; pass = r.knownUsers.size === Number(value); break;
+          case 'entity_present': {
+            const e = [...r.entities.values()].find(e => e.type === value || String(e.id) === String(value));
+            pass = !!e; actual = !!e; detail = e || null; break;
+          }
+          case 'entity_absent':
+            pass = ![...r.entities.values()].some(e => e.type === value || String(e.id) === String(value));
+            actual = !pass; break;
+        }
+        results.push({ check, value, tileId, pass, actual, detail });
+      }
+
+      const allPassed = results.every(r => r.pass);
+      return { passed: allPassed, total: results.length, passed_count: results.filter(r => r.pass).length, assertions: results };
+    }
+
+    case 'bot_ping_latency': {
+      const r = getBot(args.name); if (r.error) return r;
+      const targetSamples = args.samples ?? 0;
+
+      if (targetSamples > 0) {
+        // Collect fresh samples by waiting for ping events
+        const initialCount = r.pingLatencies.length;
+        const needed = targetSamples;
+        const timeoutMs = args.timeoutMs ?? 15000;
+        const deadline = Date.now() + timeoutMs;
+
+        await new Promise((resolve) => {
+          const check = () => {
+            if (r.pingLatencies.length - initialCount >= needed || Date.now() >= deadline) { resolve(); return; }
+            setTimeout(check, 200);
+          };
+          check();
+        });
+      }
+
+      const samples = r.pingLatencies;
+      if (samples.length === 0) return { name: args.name, error: 'No ping samples yet — bot may not have been connected long enough' };
+
+      const sorted = [...samples].sort((a, b) => a - b);
+      const avg = Math.round(samples.reduce((a, b) => a + b, 0) / samples.length);
+      const p50 = sorted[Math.floor(sorted.length * 0.5)];
+      const p95 = sorted[Math.floor(sorted.length * 0.95)];
+      return {
+        name: args.name,
+        samples: samples.length,
+        minMs: sorted[0],
+        maxMs: sorted[sorted.length - 1],
+        avgMs: avg,
+        p50Ms: p50,
+        p95Ms: p95,
+        raw: samples,
+      };
     }
 
     case 'bot_spawn_at': {
