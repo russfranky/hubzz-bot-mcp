@@ -477,6 +477,15 @@ class BotConnection extends EventEmitter {
 const bots = new Map();
 const rtcSessions = new Map();
 
+// Conductor state
+let conductorBot = null;
+let conductorInterval = null;
+let conductorConfig = {
+  firstPerson: { refDistance: 1, rolloffFactor: 0.75, distanceModel: 'exponential', volume: 1.0 },
+  isometric: { volume: 1.0 },
+};
+let conductorChatCursor = 0;
+
 // --- Bot RTC Session (mediasoup audio production) ---
 
 const RTC_SERVER = 'https://demo.hubzz.com/';
@@ -961,6 +970,53 @@ const TOOLS = [
       properties: {
         name: { type: 'string', description: 'Bot name (omit for all)' },
       },
+    },
+  },
+  {
+    name: 'bot_push_config',
+    description: 'Push a spatial audio config update to all clients in the world via a connected bot. Use this to live-tune refDistance, rolloffFactor, volume, and distanceModel.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        botName: { type: 'string', description: 'Name of a connected bot to use as the sender' },
+        firstPerson: {
+          type: 'object',
+          description: 'First-person spatial audio settings',
+          properties: {
+            refDistance: { type: 'number', description: 'Reference distance (default 1)' },
+            rolloffFactor: { type: 'number', description: 'Rolloff factor (default 0.75)' },
+            volume: { type: 'number', description: 'Volume multiplier (default 1.0)' },
+            distanceModel: { type: 'string', description: 'Distance model: exponential, linear, inverse' },
+          },
+        },
+        isometric: {
+          type: 'object',
+          description: 'Isometric (global) audio settings',
+          properties: {
+            volume: { type: 'number', description: 'Volume multiplier (default 1.0)' },
+          },
+        },
+      },
+      required: ['botName'],
+    },
+  },
+  {
+    name: 'bot_conductor_start',
+    description: 'Start a conductor bot that listens to world chat and lets you tune spatial audio in real-time by typing commands in-world. Commands: !ref N, !rolloff N, !vol N, !isovol N, !status, !stop',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        wsUrl: { type: 'string', description: 'WebSocket URL (default: wss://hubzz.xyz/socket/0,0/)' },
+        username: { type: 'string', description: 'Bot username (default: conductor)' },
+      },
+    },
+  },
+  {
+    name: 'bot_conductor_stop',
+    description: 'Stop the conductor bot and disconnect it.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
     },
   },
 ];
@@ -1500,6 +1556,163 @@ async function handleTool(name, args) {
       const all = [];
       for (const [, s] of rtcSessions) all.push(s.getState());
       return { sessions: all, count: all.length };
+    }
+
+    case 'bot_push_config': {
+      const sender = bots.get(args.botName);
+      if (!sender || !sender.connected) return { error: `Bot "${args.botName}" not connected` };
+
+      const config = {};
+      if (args.firstPerson) config.firstPerson = args.firstPerson;
+      if (args.isometric) config.isometric = args.isometric;
+
+      sender._send({ h: 'spatialAudioConfig', a: [config] });
+      return { status: 'sent', config };
+    }
+
+    case 'bot_conductor_start': {
+      const wsUrl = args.wsUrl || 'wss://hubzz.xyz/socket/0,0/';
+      const username = args.username || 'conductor';
+
+      // Stop any existing conductor
+      if (conductorInterval) {
+        clearInterval(conductorInterval);
+        conductorInterval = null;
+      }
+      if (conductorBot) {
+        conductorBot.close();
+        conductorBot = null;
+      }
+
+      // Reset config to defaults
+      conductorConfig = {
+        firstPerson: { refDistance: 1, rolloffFactor: 0.75, distanceModel: 'exponential', volume: 1.0 },
+        isometric: { volume: 1.0 },
+      };
+
+      const bot = new BotConnection(wsUrl, username, '', { autoReconnect: true });
+      await bot.connect();
+      bots.set(username, bot);
+      conductorBot = bot;
+      conductorChatCursor = bot.chatBuffer.length;
+
+      const pushConfig = (partial) => {
+        if (!bot.connected) return;
+        bot._send({ h: 'spatialAudioConfig', a: [partial] });
+      };
+
+      const say = (text) => {
+        if (!bot.connected) return;
+        bot._send({ h: 'chat', a: [text] });
+      };
+
+      conductorInterval = setInterval(() => {
+        if (!bot.connected) return;
+        const msgs = bot.chatBuffer.slice(conductorChatCursor);
+        conductorChatCursor = bot.chatBuffer.length;
+
+        for (const entry of msgs) {
+          // Ignore own messages
+          if (entry.username.toLowerCase() === username.toLowerCase()) continue;
+
+          const text = entry.message.trim();
+          if (!text.startsWith('!')) continue;
+
+          const parts = text.split(/\s+/);
+          const cmd = parts[0].toLowerCase();
+
+          if (cmd === '!ref') {
+            const v = parseFloat(parts[1]);
+            if (isNaN(v) || v <= 0) { say(`[conductor] !ref requires a positive number`); continue; }
+            conductorConfig.firstPerson.refDistance = v;
+            pushConfig({ firstPerson: { refDistance: v } });
+            say(`[conductor] refDistance → ${v}`);
+
+          } else if (cmd === '!rolloff') {
+            const v = parseFloat(parts[1]);
+            if (isNaN(v) || v < 0) { say(`[conductor] !rolloff requires a non-negative number`); continue; }
+            conductorConfig.firstPerson.rolloffFactor = v;
+            pushConfig({ firstPerson: { rolloffFactor: v } });
+            say(`[conductor] rolloffFactor → ${v}`);
+
+          } else if (cmd === '!vol') {
+            const v = parseFloat(parts[1]);
+            if (isNaN(v) || v < 0) { say(`[conductor] !vol requires a non-negative number`); continue; }
+            conductorConfig.firstPerson.volume = v;
+            pushConfig({ firstPerson: { volume: v } });
+            say(`[conductor] FPP volume → ${v}`);
+
+          } else if (cmd === '!isovol') {
+            const v = parseFloat(parts[1]);
+            if (isNaN(v) || v < 0) { say(`[conductor] !isovol requires a non-negative number`); continue; }
+            conductorConfig.isometric.volume = v;
+            pushConfig({ isometric: { volume: v } });
+            say(`[conductor] isometric volume → ${v}`);
+
+          } else if (cmd === '!louder') {
+            // Scale FPP volume or specific bot gain up by 25%
+            const target = parts[1];
+            if (target) {
+              const session = rtcSessions.get(target);
+              if (!session) { say(`[conductor] no audio session for "${target}"`); continue; }
+              const newGain = Math.min(session.gain * 1.25, 1.0);
+              session.setTone(undefined, newGain);
+              say(`[conductor] ${target} gain → ${newGain.toFixed(2)}`);
+            } else {
+              const v = Math.min((conductorConfig.firstPerson.volume || 1.0) * 1.25, 2.0);
+              conductorConfig.firstPerson.volume = v;
+              pushConfig({ firstPerson: { volume: v } });
+              say(`[conductor] FPP volume → ${v.toFixed(2)}`);
+            }
+
+          } else if (cmd === '!quieter') {
+            const target = parts[1];
+            if (target) {
+              const session = rtcSessions.get(target);
+              if (!session) { say(`[conductor] no audio session for "${target}"`); continue; }
+              const newGain = Math.max(session.gain * 0.8, 0.01);
+              session.setTone(undefined, newGain);
+              say(`[conductor] ${target} gain → ${newGain.toFixed(2)}`);
+            } else {
+              const v = Math.max((conductorConfig.firstPerson.volume || 1.0) * 0.8, 0.05);
+              conductorConfig.firstPerson.volume = v;
+              pushConfig({ firstPerson: { volume: v } });
+              say(`[conductor] FPP volume → ${v.toFixed(2)}`);
+            }
+
+          } else if (cmd === '!status') {
+            const fp = conductorConfig.firstPerson;
+            say(`[conductor] ref=${fp.refDistance} rolloff=${fp.rolloffFactor} vol=${fp.volume} model=${fp.distanceModel}`);
+
+          } else if (cmd === '!reset') {
+            conductorConfig = {
+              firstPerson: { refDistance: 1, rolloffFactor: 0.75, distanceModel: 'exponential', volume: 1.0 },
+              isometric: { volume: 1.0 },
+            };
+            pushConfig(conductorConfig);
+            say(`[conductor] reset to defaults`);
+
+          } else if (cmd === '!help') {
+            say(`[conductor] cmds: !ref N  !rolloff N  !vol N  !isovol N  !louder [bot]  !quieter [bot]  !status  !reset`);
+          }
+        }
+      }, 500);
+
+      return { status: 'started', username, wsUrl };
+    }
+
+    case 'bot_conductor_stop': {
+      if (conductorInterval) {
+        clearInterval(conductorInterval);
+        conductorInterval = null;
+      }
+      if (conductorBot) {
+        const name = conductorBot.username;
+        conductorBot.close();
+        bots.delete(name);
+        conductorBot = null;
+      }
+      return { status: 'stopped' };
     }
 
     default:
