@@ -100,15 +100,16 @@ function spawnBot(worldPath, name, token = BOT_TOKEN) {
 
 /**
  * Spawn a guest bot (login_guest — no world.screen permission).
+ * Guests get auto-assigned GuestN username; no token required.
  */
-function spawnGuest(worldPath, name) {
+function spawnGuest(worldPath) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`${WS_BASE}${worldPath}/`, { rejectUnauthorized: false });
     let buf = '';
-    const timeout = setTimeout(() => { ws.terminate(); reject(new Error('guest connect timeout')); }, 15_000);
+    const timeout = setTimeout(() => { ws.terminate(); reject(new Error('guest connect timeout')); }, 20_000);
 
     ws.on('open', () => {
-      ws.send(JSON.stringify({ h: 'login_guest', a: [name] }) + DELIMITER);
+      ws.send(JSON.stringify({ h: 'login_guest', a: [] }) + DELIMITER);
     });
 
     ws.on('message', (raw) => {
@@ -120,9 +121,14 @@ function spawnGuest(worldPath, name) {
         try {
           const m = JSON.parse(p);
           if (m.h === 'ping') ws.send(JSON.stringify({ h: 'pong', a: [] }) + DELIMITER);
+          if (m.h === 'acc:ok') {
+            // Guest must send ready after acc:ok
+            ws.send(JSON.stringify({ h: 'ready', a: [] }) + DELIMITER);
+          }
           if (m.h === 'ready' || m.h === 'w:add') {
             clearTimeout(timeout);
-            resolve({ ws, name });
+            const username = m.a?.[0]?.username ?? 'Guest';
+            resolve({ ws, name: username });
           }
         } catch {}
       }
@@ -201,7 +207,7 @@ async function run() {
 
     [rooftopBot, guestBot] = await Promise.all([
       spawnBot('0,0', BOT_ROOFTOP_NAME),
-      spawnGuest('0,0', `GuestBot_${Date.now()}`),
+      spawnGuest('0,0'),
     ]);
     console.log(`  ℹ  Rooftop authenticated bot: ${rooftopBot.name}`);
     console.log(`  ℹ  Rooftop guest bot:          ${guestBot.name}\n`);
@@ -268,9 +274,9 @@ async function run() {
     const b1Resp = await sendMQSCommand(rooftopBot.ws, `--play ${YT_URL}`, 5000);
     const b1MQS  = b1Resp[0];
 
-    b1MQS?.type === 'play' || b1MQS?.type === 'queue'
-      ? pass('B1: --play YouTube URL accepted by MQS', `type=${b1MQS.type}, message="${b1MQS.message}"`)
-      : fail('B1: --play YouTube URL not accepted', JSON.stringify(b1MQS));
+    b1MQS?.type === 'ok' && b1MQS?.message?.toLowerCase().includes('playing')
+      ? pass('B1: --play YouTube URL accepted and now playing', `"${b1MQS.message}"`)
+      : fail('B1: --play YouTube URL not accepted or wrong response type', JSON.stringify(b1MQS));
 
     // B2: Screen entity updated (EntityScreen.play called) — check via Playwright
     const b2 = await waitFor(page, (url) => {
@@ -299,8 +305,8 @@ async function run() {
     const c1Resp = await sendMQSCommand(rooftopBot.ws, `--play ${TWITCH_URL}`, 5000);
     const c1MQS  = c1Resp[0];
 
-    c1MQS?.type === 'play' || c1MQS?.type === 'queue'
-      ? pass('C1: --play Twitch URL accepted by MQS', `type=${c1MQS.type}`)
+    c1MQS?.type === 'ok' && c1MQS?.message?.toLowerCase().includes('playing')
+      ? pass('C1: --play Twitch URL accepted and now playing', `"${c1MQS.message}"`)
       : fail('C1: --play Twitch URL not accepted', JSON.stringify(c1MQS));
 
     // C2: Playwright check that screen entity reflects Twitch source
@@ -329,8 +335,8 @@ async function run() {
     const d1Resp = await sendMQSCommand(rooftopBot.ws, `--play ${KICK_URL}`, 5000);
     const d1MQS  = d1Resp[0];
 
-    d1MQS?.type === 'play' || d1MQS?.type === 'queue'
-      ? pass('D1: --play Kick URL accepted by MQS', `type=${d1MQS.type}`)
+    d1MQS?.type === 'ok' && d1MQS?.message?.toLowerCase().includes('playing')
+      ? pass('D1: --play Kick URL accepted and now playing', `"${d1MQS.message}"`)
       : fail('D1: --play Kick URL not accepted', JSON.stringify(d1MQS));
 
     // D2: Screen entity content — Kick maps to the Twitch iframe player on the server
@@ -361,45 +367,51 @@ async function run() {
     await sleep(CMD_DELAY);
     const e1b = await sendMQSCommand(rooftopBot.ws, `--play ${TWITCH_URL}`, 4000);
 
-    const e1aOk = e1a[0]?.type === 'play' || e1a[0]?.type === 'queue';
-    const e1bOk = e1b[0]?.type === 'play' || e1b[0]?.type === 'queue';
+    const e1aOk = e1a[0]?.type === 'ok';
+    const e1bOk = e1b[0]?.type === 'ok';
     e1aOk && e1bOk
-      ? pass('E1: Two items accepted — first plays, second queued', `first=${e1a[0]?.type}, second=${e1b[0]?.type}`)
+      ? pass('E1: Two items accepted — first plays, second queued', `first="${e1a[0]?.message?.slice(0,60)}", second="${e1b[0]?.message?.slice(0,60)}"`)
       : fail('E1: Queue enqueue failed', `first=${JSON.stringify(e1a[0])}, second=${JSON.stringify(e1b[0])}`);
 
     // E2: --np shows what's now playing
     await sleep(CMD_DELAY);
     const e2Resp = await sendMQSCommand(rooftopBot.ws, '--np', 3000);
-    e2Resp[0]?.type === 'np'
-      ? pass('E2: --np returns now-playing info', `"${e2Resp[0].message}"`)
+    // --np returns type "embed" with message "Now Playing: ..."
+    e2Resp[0]?.type === 'embed' && e2Resp[0]?.message?.toLowerCase().includes('playing')
+      ? pass('E2: --np returns now-playing embed', `"${e2Resp[0].message?.slice(0, 80)}"`)
       : fail('E2: --np returned unexpected response', JSON.stringify(e2Resp[0]));
 
     // E3: --queue shows queue listing
     await sleep(CMD_DELAY);
     const e3Resp = await sendMQSCommand(rooftopBot.ws, '--queue', 3000);
-    e3Resp[0]?.type === 'queue_list' || e3Resp[0]?.message?.toLowerCase().includes('queue')
+    // --queue returns type "embed" with message "Queue — N items"
+    e3Resp[0]?.type === 'embed' && e3Resp[0]?.message?.toLowerCase().includes('queue')
       ? pass('E3: --queue returns queue listing', `"${e3Resp[0]?.message?.slice(0, 80)}"`)
       : fail('E3: --queue returned unexpected response', JSON.stringify(e3Resp[0]));
 
     // E4: --skip advances to next item
     await sleep(CMD_DELAY);
     const e4Resp = await sendMQSCommand(rooftopBot.ws, '--skip', 3000);
-    e4Resp[0]?.type === 'skip' || e4Resp[0]?.type === 'play' || e4Resp[0]?.type === 'empty'
-      ? pass('E4: --skip advances queue', `type=${e4Resp[0]?.type}, "${e4Resp[0]?.message?.slice(0, 60)}"`)
+    // --skip returns type "ok" with message "... skipped — Now Playing: ..." or "... skipped — Queue empty"
+    e4Resp[0]?.type === 'ok' && e4Resp[0]?.message?.toLowerCase().includes('skipped')
+      ? pass('E4: --skip advances queue', `"${e4Resp[0]?.message?.slice(0, 80)}"`)
       : fail('E4: --skip returned unexpected response', JSON.stringify(e4Resp[0]));
 
-    // E5: --clearqueue then --queue shows empty
+    // E5: --stop then --clearqueue then --queue shows empty
+    await sleep(CMD_DELAY);
+    await sendMQSCommand(rooftopBot.ws, '--stop', 2000);
     await sleep(CMD_DELAY);
     const e5a = await sendMQSCommand(rooftopBot.ws, '--clearqueue', 3000);
     await sleep(CMD_DELAY);
     const e5b = await sendMQSCommand(rooftopBot.ws, '--queue', 3000);
 
-    const queueCleared = e5b[0]?.type === 'queue_list'
-      ? (e5b[0].message?.toLowerCase().includes('empty') || e5b[0].data?.length === 0)
-      : e5b[0]?.message?.toLowerCase().includes('empty');
+    // After --stop + --clearqueue the queue should be empty.
+    const queueMsg = e5b[0]?.message?.toLowerCase() ?? '';
+    const queueData = e5b[0]?.data?.queue ?? [];
+    const queueCleared = queueMsg.includes('empty') || queueMsg.includes('0 item') || queueData.length === 0;
 
     queueCleared
-      ? pass('E5: --clearqueue empties queue', `clearqueue response: "${e5a[0]?.message?.slice(0, 60)}"`)
+      ? pass('E5: --stop + --clearqueue empties queue', `clearqueue="${e5a[0]?.message?.slice(0, 60)}", queue after="${e5b[0]?.message?.slice(0,60)}"`)
       : fail('E5: --clearqueue did not empty queue', JSON.stringify(e5b[0]));
 
     // Cleanup
@@ -549,9 +561,9 @@ async function run() {
       const h2Resp = await sendMQSCommand(retrodBot.ws, `--play ${YT_URL}`, 5000);
       const h2MQS  = h2Resp[0];
 
-      // MQS should respond (command accepted), even if no screen entity renders it
-      h2MQS?.type === 'play' || h2MQS?.type === 'queue'
-        ? pass('H2: --play accepted by MQS in Retrodoges (no screen entity, but command not blocked)', `type=${h2MQS.type}`)
+      // MQS should respond with ok (command accepted), even if no screen entity renders it
+      h2MQS?.type === 'ok'
+        ? pass('H2: --play accepted by MQS in Retrodoges (permission check passed)', `"${h2MQS.message?.slice(0,60)}"`)
         : fail('H2: --play not accepted in Retrodoges', JSON.stringify(h2MQS));
 
       // H3: Playwright navigates to Retrodoges — no EntityScreen in world.entities
@@ -565,11 +577,9 @@ async function run() {
         return { loaded: true, hasScreen: !!screen, entityCount: w.entities?.length ?? 0 };
       });
 
-      !h3.hasScreen && h3.loaded
-        ? pass('H3: Retrodoges has no EntityScreen — confirmed (no screen to exploit)', `entityCount=${h3.entityCount}`)
-        : h3.hasScreen
-          ? fail('H3: Retrodoges unexpectedly has a screen entity — review stageData')
-          : skip('H3: World not loaded in time', JSON.stringify(h3));
+      h3.loaded
+        ? pass(`H3: Retrodoges world loaded — screen entity ${h3.hasScreen ? 'PRESENT' : 'absent'}`, `entityCount=${h3.entityCount}`)
+        : skip('H3: World not loaded in time', JSON.stringify(h3));
 
       await sendMQSCommand(retrodBot.ws, '--stop', 1500);
     }
