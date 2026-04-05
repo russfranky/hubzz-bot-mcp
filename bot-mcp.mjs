@@ -28,6 +28,8 @@ globalThis.MediaStreamTrack = MediaStreamTrack;
 // --- Configuration ---
 
 const DEFAULT_WS_URL = process.env.HUBZZ_WS_URL || 'wss://hubzz.xyz/socket/';
+const BOT_TOKEN = process.env.HUBZZ_BOT_TOKEN;
+if (!BOT_TOKEN) { console.error('[bot-mcp] HUBZZ_BOT_TOKEN env var is required'); process.exit(1); }
 const DELIMITER = '\uF8FF';
 const MAX_CHAT_BUFFER = 50;
 const MAX_EVENT_BUFFER = 200;
@@ -71,6 +73,7 @@ class BotConnection extends EventEmitter {
     this.username = username;
     this.vrmUrl = vrmUrl;
     this.isGuest = opts.isGuest || false;
+    this.token = opts.token || BOT_TOKEN;
     this.ws = null;
     this.connected = false;
     this.intentionallyClosed = false;
@@ -137,7 +140,7 @@ class BotConnection extends EventEmitter {
         if (this.isGuest) {
           this._send({ h: 'login_guest', a: [] });
         } else {
-          this._send({ h: 'login', a: ['iamar0b0t', this.username, this.vrmUrl] });
+          this._send({ h: 'login', a: [this.token, this.username, this.vrmUrl] });
         }
       });
 
@@ -270,7 +273,29 @@ class BotConnection extends EventEmitter {
         break;
 
       case 'w:call': {
-        const [target, func, ...callArgs] = msg.a || [];
+        // Server sends: { h: 'w:call', a: [{ id, f, g, a }] }
+        // where id = session id, f = function name, a = args array
+        const callMsg = msg.a?.[0];
+        const func = callMsg?.f;
+        const target = callMsg?.id;
+        const callArgs = callMsg?.a || [];
+
+        // Chat messages arrive as w:call with f='chat' — populate chatBuffer
+        if (func === 'chat') {
+          const text = callArgs[0];
+          const userId = String(target);
+          const user = this.knownUsers.get(userId);
+          const entry = {
+            userId,
+            username: user?.username ?? 'unknown',
+            message: String(text ?? ''),
+            timestamp: Date.now(),
+          };
+          this.chatBuffer.push(entry);
+          if (this.chatBuffer.length > MAX_CHAT_BUFFER) this.chatBuffer.shift();
+          this._bufferEvent('chat', entry);
+        }
+
         this._bufferEvent('w:call', { target, func, args: callArgs });
         break;
       }
@@ -698,6 +723,7 @@ const TOOLS = [
         name: { type: 'string', description: 'Bot username (unique identifier)' },
         wsUrl: { type: 'string', description: `WebSocket URL (default: ${DEFAULT_WS_URL})` },
         vrmUrl: { type: 'string', description: 'VRM avatar URL (optional)' },
+        token: { type: 'string', description: 'hbz_ access token override (default: HUBZZ_BOT_TOKEN env)' },
         autoReconnect: { type: 'boolean', description: 'Enable auto-reconnect on disconnect (default: false)' },
       },
       required: ['name'],
@@ -1113,7 +1139,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         name: { type: 'string', description: 'Bot name' },
-        action: { type: 'string', enum: ['play', 'stop', 'call'], description: 'play = !play url, stop = !stop, call = raw entity call' },
+        action: { type: 'string', enum: ['play', 'stop', 'call'], description: 'play = --play url, stop = --stop, call = raw entity call' },
         url: { type: 'string', description: 'Video/media URL (required for play)' },
         entityId: { type: 'string', description: 'Entity ID (required for call)' },
         method: { type: 'string', description: 'Method name for call action' },
@@ -1308,7 +1334,7 @@ async function handleTool(name, args) {
       const botName = args.name;
       if (bots.has(botName)) return { error: `Bot "${botName}" already exists. Close it first or use a different name.` };
       const wsUrl = args.wsUrl || DEFAULT_WS_URL;
-      const bot = new BotConnection(wsUrl, botName, args.vrmUrl || '', { autoReconnect: args.autoReconnect || false });
+      const bot = new BotConnection(wsUrl, botName, args.vrmUrl || '', { autoReconnect: args.autoReconnect || false, token: args.token });
       try {
         await bot.connect();
         bots.set(botName, bot);
@@ -1985,10 +2011,10 @@ async function handleTool(name, args) {
       const r = getBot(args.name); if (r.error) return r;
       if (args.action === 'play') {
         if (!args.url) return { error: 'url required for play action' };
-        r.sendChat(`!play ${args.url}`);
+        r.sendChat(`--play ${args.url}`);
         return { status: 'play_sent', url: args.url };
       } else if (args.action === 'stop') {
-        r.sendChat('!stop');
+        r.sendChat('--stop');
         return { status: 'stop_sent' };
       } else if (args.action === 'call') {
         if (!args.entityId || !args.method) return { error: 'entityId and method required for call action' };
