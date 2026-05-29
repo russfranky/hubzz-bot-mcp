@@ -1,0 +1,7 @@
+{
+  "name": "hubzz-bot-mcp",
+  "version": "1.0.0",
+  "description": "Hubzz bot MCP for Cursor Cloud Agents",
+  "bin": { "hubzz-bot-mcp": "./bot-mcp.cjs" },
+  "main": "bot-mcp.cjs"
+}
