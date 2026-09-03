@@ -1,7 +1,20 @@
 {
-  "name": "hubzz-bot-mcp",
+  "name": "@hubzz/bot-mcp",
   "version": "1.0.0",
-  "description": "Hubzz bot MCP for Cursor Cloud Agents",
-  "bin": { "hubzz-bot-mcp": "./bot-mcp.cjs" },
-  "main": "bot-mcp.cjs"
+  "description": "MCP server for spawning and controlling bots in Hubzz worlds",
+  "type": "module",
+  "main": "bot-mcp.mjs",
+  "scripts": {
+    "start": "node bot-mcp.mjs",
+    "start:http": "node bot-mcp-http.mjs",
+    "test": "node test-http-wrapper.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.81.0",
+    "@roamhq/wrtc": "^0.10.0",
+    "mediasoup-client": "^3.18.7",
+    "playwright": "^1.58.2",
+    "socket.io-client": "^4.8.3",
+    "ws": "^8.18.0"
+  }
 }
