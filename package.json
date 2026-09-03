@@ -5,7 +5,9 @@
   "type": "module",
   "main": "bot-mcp.mjs",
   "scripts": {
-    "start": "node bot-mcp.mjs"
+    "start": "node bot-mcp.mjs",
+    "start:http": "node bot-mcp-http.mjs",
+    "test": "node test-http-wrapper.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.81.0",
