@@ -5,18 +5,20 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 if (process.env.BOT_MCP_FIXTURE_CHILD === '1') {
-  let buffer = '';
-  process.stdin.setEncoding('utf8');
+  let buffer = Buffer.alloc(0);
   process.stdin.on('data', chunk => {
-    buffer += chunk;
-    let newline;
-    while ((newline = buffer.indexOf('\n')) !== -1) {
-      const line = buffer.slice(0, newline).trim();
-      buffer = buffer.slice(newline + 1);
-      if (!line) continue;
-      const request = JSON.parse(line);
+    buffer = Buffer.concat([buffer, chunk]);
+    while (true) {
+      const headerEnd = buffer.indexOf('\r\n\r\n');
+      if (headerEnd === -1) break;
+      const header = buffer.subarray(0, headerEnd).toString('ascii');
+      const contentLength = Number(header.match(/Content-Length:\s*(\d+)/i)?.[1]);
+      const bodyStart = headerEnd + 4;
+      if (!Number.isInteger(contentLength) || buffer.length < bodyStart + contentLength) break;
+      const request = JSON.parse(buffer.subarray(bodyStart, bodyStart + contentLength).toString('utf8'));
+      buffer = buffer.subarray(bodyStart + contentLength);
       if (request.id == null) continue;
-      process.stdout.write(JSON.stringify({
+      const response = JSON.stringify({
         jsonrpc: '2.0',
         id: request.id,
         result: {
@@ -24,7 +26,8 @@ if (process.env.BOT_MCP_FIXTURE_CHILD === '1') {
           capabilities: {},
           serverInfo: { name: 'bot-mcp-http-test-child', version: '1' },
         },
-      }) + '\n');
+      });
+      process.stdout.write(`Content-Length: ${Buffer.byteLength(response)}\r\n\r\n${response}`);
     }
   });
 } else {
@@ -109,7 +112,7 @@ if (process.env.BOT_MCP_FIXTURE_CHILD === '1') {
     }
 
     assert.equal(response?.result?.serverInfo?.name, 'bot-mcp-http-test-child');
-    console.log('bot-mcp HTTP wrapper child override: PASS');
+    console.log('bot-mcp HTTP wrapper canonical framing: PASS');
   } finally {
     controller.abort();
     wrapper.kill('SIGTERM');

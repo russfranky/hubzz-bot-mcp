@@ -78,18 +78,26 @@ const server = http.createServer((req, res) => {
     sessions.set(sessionId, { child, res });
     console.error(`[http] session ${sessionId} opened (pid ${child.pid})`);
 
-    // Forward child stdout → SSE data events
-    let buf = '';
-    child.stdout.setEncoding('utf8');
+    // Forward Content-Length framed child stdout → SSE data events.
+    let buf = Buffer.alloc(0);
     child.stdout.on('data', chunk => {
-      buf += chunk;
-      let i;
-      while ((i = buf.indexOf('\n')) !== -1) {
-        const line = buf.slice(0, i).trim();
-        buf = buf.slice(i + 1);
-        if (line) {
-          res.write(`data: ${line}\n\n`);
+      buf = Buffer.concat([buf, chunk]);
+      while (true) {
+        const headerEnd = buf.indexOf('\r\n\r\n');
+        if (headerEnd === -1) break;
+
+        const header = buf.subarray(0, headerEnd).toString('ascii');
+        const contentLength = Number(header.match(/Content-Length:\s*(\d+)/i)?.[1]);
+        const bodyStart = headerEnd + 4;
+        if (!Number.isInteger(contentLength)) {
+          buf = buf.subarray(bodyStart);
+          continue;
         }
+        if (buf.length < bodyStart + contentLength) break;
+
+        const message = buf.subarray(bodyStart, bodyStart + contentLength).toString('utf8');
+        buf = buf.subarray(bodyStart + contentLength);
+        res.write(`data: ${message}\n\n`);
       }
     });
 
@@ -123,7 +131,9 @@ const server = http.createServer((req, res) => {
     req.on('data', d => body += d);
     req.on('end', () => {
       try {
-        session.child.stdin.write(body.trim() + '\n');
+        const message = body.trim();
+        const framed = `Content-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`;
+        session.child.stdin.write(framed);
         res.writeHead(202);
         res.end('Accepted');
       } catch (e) {
