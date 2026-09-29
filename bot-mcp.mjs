@@ -1562,8 +1562,9 @@ async function handleTool(name, args) {
 
       // Spawn
       const spawnStart = Date.now();
+      const stressPrefix = args.prefix ?? 'test';
       for (let i = 0; i < count; i++) {
-        const botName = `_stress_${args.prefix}-${i}`;
+        const botName = `_stress_${stressPrefix}-${i}`;
         if (bots.has(botName)) { bots.get(botName).close(); bots.delete(botName); }
         const bot = new BotConnection(wsUrl, botName, '', {});
         try {
@@ -2030,6 +2031,7 @@ async function handleTool(name, args) {
 
     case 'bot_kick_test': {
       const r = getBot(args.name); if (r.error) return r;
+      if (['kick', 'ban', 'grant'].includes(args.action) && (args.target == null || String(args.target).trim() === '')) return { error: 'target is required' };
       if (args.action === 'kick') {
         r.sendChat(`!kick ${args.target}`);
       } else if (args.action === 'ban') {
