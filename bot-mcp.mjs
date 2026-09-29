@@ -30,6 +30,18 @@ globalThis.MediaStreamTrack = MediaStreamTrack;
 // --- Configuration ---
 
 const DEFAULT_WS_URL = process.env.HUBZZ_WS_URL || 'wss://hubzz.xyz/socket/';
+// S-001: wsUrl allowlist — the real HUBZZ_BOT_TOKEN is sent in the login frame,
+// so never connect to an arbitrary host. Returns error string or null.
+const WS_URL_ALLOWLIST = ['hubzz.xyz', 'hubzz.app', 'localhost', '127.0.0.1'];
+function validateWsUrl(raw) {
+  const wsUrl = raw || DEFAULT_WS_URL;
+  let host;
+  try { host = new URL(wsUrl).hostname.toLowerCase(); }
+  catch (_) { return { error: 'wsUrl must be a valid WebSocket URL' }; }
+  const ok = WS_URL_ALLOWLIST.some(h => host === h || host.endsWith('.' + h));
+  if (!ok) return { error: `wsUrl host not allowed: ${host}` };
+  return { wsUrl };
+}
 const BOT_TOKEN = process.env.HUBZZ_BOT_TOKEN;
 if (!BOT_TOKEN) { console.error('[bot-mcp] HUBZZ_BOT_TOKEN env var is required'); process.exit(1); }
 const DELIMITER = '\uF8FF';
@@ -59,11 +71,20 @@ import { execFile } from 'child_process';
 
 function fetchJsonViaCurl(url, timeoutMs) {
   return new Promise((resolve, reject) => {
+    // S-002: validate URL before it reaches curl — blocks option injection
+    // (e.g. mapUrl:'-o /tmp/pwned') and non-http(s) SSRF vectors.
+    let parsed;
+    try { parsed = new URL(url); }
+    catch (_) { reject(new Error('fetchJson: invalid URL')); return; }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      reject(new Error('fetchJson: only http(s) URLs allowed')); return;
+    }
     const args = [
       '-sS', '-f',           // silent, fail on HTTP error
       '--proxy', process.env.https_proxy || process.env.HTTPS_PROXY,
       '--max-time', String(Math.ceil(timeoutMs / 1000)),
       '-L', '--max-redirs', '5',
+      '--',                  // S-002: end of options — url cannot be parsed as flags
       url,
     ];
     execFile('curl', args, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
@@ -1406,7 +1427,9 @@ async function handleTool(name, args) {
       const botName = args.name;
       if (botName == null || String(botName).trim() === '') return { error: 'name is required' };
       if (bots.has(botName)) return { error: `Bot "${botName}" already exists. Close it first or use a different name.` };
-      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const wsCheck = validateWsUrl(args.wsUrl);
+      if (wsCheck.error) return wsCheck;
+      const wsUrl = wsCheck.wsUrl;
       const bot = new BotConnection(wsUrl, botName, args.vrmUrl || '', { autoReconnect: args.autoReconnect || false, token: args.token });
       try {
         await bot.connect();
@@ -1483,7 +1506,9 @@ async function handleTool(name, args) {
     case 'bot_batch_spawn': {
       const count = Math.min(Math.max(1, args.count || 1), MAX_BATCH_SIZE);
       const staggerMs = args.staggerMs ?? 500;
-      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const wsCheck = validateWsUrl(args.wsUrl);
+      if (wsCheck.error) return wsCheck;
+      const wsUrl = wsCheck.wsUrl;
       const results = [];
       const startTime = Date.now();
       const prefix = args.prefix ?? 'bot';
@@ -1557,7 +1582,9 @@ async function handleTool(name, args) {
       const count = Math.min(Math.max(1, args.count || 1), MAX_BATCH_SIZE);
       const durationSec = Math.min(Math.max(1, args.durationSec || 10), MAX_STRESS_DURATION);
       const mps = Math.min(Math.max(0.1, args.messagesPerSec || 1), 5);
-      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const wsCheck = validateWsUrl(args.wsUrl);
+      if (wsCheck.error) return wsCheck;
+      const wsUrl = wsCheck.wsUrl;
       const test = args.test;
       const testBots = [];
       const metrics = { botsSpawned: 0, botsFailed: 0, messagesAttempted: 0, messagesFailed: 0, droppedConnections: 0, errors: [] };
@@ -1868,7 +1895,9 @@ async function handleTool(name, args) {
 
     case 'bot_spatial_grid': {
       const prefix = args.prefix || 'audio';
-      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const wsCheck = validateWsUrl(args.wsUrl);
+      if (wsCheck.error) return wsCheck;
+      const wsUrl = wsCheck.wsUrl;
       const voiceOn = args.voiceOn !== false;
       const staggerMs = args.staggerMs ?? 400;
       const tiles = args.tiles || [];
@@ -1936,7 +1965,9 @@ async function handleTool(name, args) {
       if (rtcSessions.has(botName)) return { error: `Bot "${botName}" already has an active audio session. Use bot_audio_stop first.` };
 
       // Derive room_id from wsUrl: wss://hubzz.xyz/socket/0,0/ → hubzz.xyz@0,0
-      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const wsCheck = validateWsUrl(args.wsUrl);
+      if (wsCheck.error) return wsCheck;
+      const wsUrl = wsCheck.wsUrl;
       const urlObj = new URL(wsUrl);
       const hostname = urlObj.hostname;
       const worldPath = urlObj.pathname.replace(/^\/socket\//, '').replace(/\/$/, '') || '0,0';
@@ -2018,7 +2049,9 @@ async function handleTool(name, args) {
     case 'bot_guest': {
       if (args.name == null || String(args.name).trim() === '') return { error: 'name is required' };
       if (bots.has(args.name)) return { error: `Bot "${args.name}" already exists. Close it first or use a different name.` };
-      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const wsCheck = validateWsUrl(args.wsUrl);
+      if (wsCheck.error) return wsCheck;
+      const wsUrl = wsCheck.wsUrl;
       const bot = new BotConnection(wsUrl, args.name, '', { isGuest: true });
       try {
         await bot.connect();
@@ -2285,7 +2318,9 @@ async function handleTool(name, args) {
       if (bots.has(args.name)) return { error: `Bot "${args.name}" already exists. Close it first or use a different name.` };
       const spawnTileId = Number(args.tileId);
       if (!Number.isFinite(spawnTileId)) return { error: `Invalid tileId: ${args.tileId}` };
-      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const wsCheck = validateWsUrl(args.wsUrl);
+      if (wsCheck.error) return wsCheck;
+      const wsUrl = wsCheck.wsUrl;
       const bot = new BotConnection(wsUrl, args.name, args.vrmUrl || '', {});
       try {
         await bot.connect();
@@ -2306,7 +2341,9 @@ async function handleTool(name, args) {
     }
 
     case 'bot_directional_ring': {
-      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const wsCheck = validateWsUrl(args.wsUrl);
+      if (wsCheck.error) return wsCheck;
+      const wsUrl = wsCheck.wsUrl;
       const mapUrl = args.mapUrl || 'https://hubzz.xyz/data/maps/world_2.json';
       const distance = Number(args.distance ?? 10);
       if (!Number.isFinite(distance) || distance < 0) return { error: 'distance must be a non-negative number' };
@@ -2426,7 +2463,9 @@ async function handleTool(name, args) {
 
     case 'bot_scene_audio': {
       const action = args.action || 'setup';
-      const wsUrl = args.wsUrl || DEFAULT_WS_URL;
+      const wsCheck = validateWsUrl(args.wsUrl);
+      if (wsCheck.error) return wsCheck;
+      const wsUrl = wsCheck.wsUrl;
 
       if (action === 'teardown') {
         // Stop conductor
