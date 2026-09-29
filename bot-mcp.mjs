@@ -2098,6 +2098,7 @@ async function handleTool(name, args) {
     case 'bot_kbs': {
       const r = getBot(args.name); if (r.error) return r;
       const pos = args.position;
+      if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number' || typeof pos.z !== 'number') return { error: 'position {x,y,z} is required' };
       const rot = args.rotation || { x: 0, y: 0, z: 0 };
       const anim = args.animation || 'anim_idle';
       r._send({ h: 'kbs', a: [pos, rot, anim] });
