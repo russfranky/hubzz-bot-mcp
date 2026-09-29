@@ -1547,8 +1547,10 @@ async function handleTool(name, args) {
       }
       // start
       if (!Array.isArray(args.tiles) || args.tiles.length === 0 || args.tiles.some(t => !Number.isFinite(Number(t)))) return { error: 'tiles must be an array of numeric tile IDs' };
-      r.startPatrol(args.tiles, args.intervalMs || 2000, args.loop !== false);
-      return { status: 'patrolling', name: args.name, tiles: args.tiles.length, intervalMs: args.intervalMs || 2000, loop: args.loop !== false };
+      const patrolIntervalMs = args.intervalMs == null ? 2000 : Number(args.intervalMs);
+      if (!Number.isFinite(patrolIntervalMs) || patrolIntervalMs < 100) return { error: 'intervalMs must be a number >= 100' };
+      r.startPatrol(args.tiles, patrolIntervalMs, args.loop !== false);
+      return { status: 'patrolling', name: args.name, tiles: args.tiles.length, intervalMs: patrolIntervalMs, loop: args.loop !== false };
     }
 
     case 'bot_stress_test': {
@@ -2048,7 +2050,8 @@ async function handleTool(name, args) {
 
     case 'bot_watch_events': {
       const r = getBot(args.name); if (r.error) return r;
-      const timeoutMs = args.timeoutMs ?? 5000;
+      const timeoutMs = Number(args.timeoutMs ?? 5000);
+      if (!Number.isFinite(timeoutMs) || timeoutMs < 0) return { error: 'timeoutMs must be a non-negative number' };
       const eventType = args.eventType || '*';
 
       let matchFn = null;
@@ -2129,11 +2132,13 @@ async function handleTool(name, args) {
 
     case 'bot_world_wait': {
       const r = getBot(args.name); if (r.error) return r;
-      const timeoutMs = args.timeoutMs ?? 10000;
+      const timeoutMs = Number(args.timeoutMs ?? 10000);
+      if (!Number.isFinite(timeoutMs) || timeoutMs < 0) return { error: 'timeoutMs must be a non-negative number' };
       const condition = args.condition;
       const validConditions = ['user_joined','user_left','chat_received','notice_received','entity_added','entity_removed','user_count_gte','user_count_lte'];
       if (!validConditions.includes(condition)) return { error: `Unknown condition: ${condition}` };
       const value = args.value;
+      if ((condition === 'user_count_gte' || condition === 'user_count_lte') && !Number.isFinite(Number(value))) return { error: 'value must be a number for user_count_* conditions' };
       const deadline = Date.now() + timeoutMs;
 
       const poll = () => new Promise((resolve, reject) => {
@@ -2243,7 +2248,8 @@ async function handleTool(name, args) {
         // Collect fresh samples by waiting for ping events
         const initialCount = r.pingLatencies.length;
         const needed = targetSamples;
-        const timeoutMs = args.timeoutMs ?? 15000;
+        const timeoutMs = Number(args.timeoutMs ?? 15000);
+        if (!Number.isFinite(timeoutMs) || timeoutMs < 0) return { error: 'timeoutMs must be a non-negative number' };
         const deadline = Date.now() + timeoutMs;
 
         await new Promise((resolve) => {
@@ -2302,7 +2308,8 @@ async function handleTool(name, args) {
     case 'bot_directional_ring': {
       const wsUrl = args.wsUrl || DEFAULT_WS_URL;
       const mapUrl = args.mapUrl || 'https://hubzz.xyz/data/maps/world_2.json';
-      const distance = args.distance ?? 10;
+      const distance = Number(args.distance ?? 10);
+      if (!Number.isFinite(distance) || distance < 0) return { error: 'distance must be a non-negative number' };
       const prefix = args.prefix || 'dir';
       const gain = args.gain ?? 0.7;
       const startAudio = args.startAudio !== false;
