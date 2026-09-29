@@ -1559,7 +1559,7 @@ async function handleTool(name, args) {
         try {
           await bot.connect();
           bots.set(botName, bot);
-          testBots.push(bot);
+          testBots.push({ bot, botName });
           metrics.botsSpawned++;
         } catch (err) {
           bot.close();
@@ -1572,7 +1572,7 @@ async function handleTool(name, args) {
 
       if (test === 'connect') {
         // Just measure spawn, then cleanup
-        for (const bot of testBots) { bot.close(); bots.delete(`_stress_${args.prefix}-${testBots.indexOf(bot)}`); }
+        for (const { bot, botName } of testBots) { bot.close(); bots.delete(botName); }
         return { test: 'connect', ...metrics, spawnTimeMs, avgSpawnMs: metrics.botsSpawned > 0 ? Math.round(spawnTimeMs / metrics.botsSpawned) : null };
       }
 
@@ -1615,13 +1615,12 @@ async function handleTool(name, args) {
       const testTimeMs = Date.now() - testStart;
 
       // Collect latency stats
-      const latencies = testBots.filter(b => b.pingLatencies.length > 0).map(b => b.pingLatencies.reduce((a, c) => a + c, 0) / b.pingLatencies.length);
+      const latencies = testBots.filter(({ bot }) => bot.pingLatencies.length > 0).map(({ bot }) => bot.pingLatencies.reduce((a, c) => a + c, 0) / bot.pingLatencies.length);
       const avgLatency = latencies.length > 0 ? Math.round(latencies.reduce((a, c) => a + c, 0) / latencies.length) : null;
 
       // Close test bots
-      for (let i = 0; i < testBots.length; i++) {
-        const botName = `_stress_${args.prefix}-${i}`;
-        testBots[i].close();
+      for (const { bot, botName } of testBots) {
+        bot.close();
         bots.delete(botName);
       }
 
@@ -1650,6 +1649,7 @@ async function handleTool(name, args) {
 
     case 'bot_nick': {
       const r = getBot(args.name); if (r.error) return r;
+      if (args.newNick == null || String(args.newNick).trim() === '') return { error: 'newNick is required' };
       r.sendChat(`!nick ${args.newNick}`);
       return { status: 'nick_sent', name: args.name, newNick: args.newNick };
     }
@@ -1775,6 +1775,7 @@ async function handleTool(name, args) {
         center = walkable.find(t => t.id === args.centerTileId);
         if (!center) return { error: `Tile ${args.centerTileId} not found or not walkable` };
       } else {
+        if (walkable.length === 0) return { error: 'No walkable tiles in map' };
         center = walkable.reduce((best, t) => dist2d(t, 0, 0) < dist2d(best, 0, 0) ? t : best);
       }
 
@@ -1905,6 +1906,7 @@ async function handleTool(name, args) {
 
     case 'bot_voice_all': {
       const state = args.state;
+      if (typeof state !== 'boolean') return { error: 'state (boolean) is required' };
       const updated = [];
       for (const [n, bot] of bots) {
         if (bot.connected) {
@@ -1998,6 +2000,8 @@ async function handleTool(name, args) {
     }
 
     case 'bot_guest': {
+      if (args.name == null || String(args.name).trim() === '') return { error: 'name is required' };
+      if (bots.has(args.name)) return { error: `Bot "${args.name}" already exists. Close it first or use a different name.` };
       const wsUrl = args.wsUrl || DEFAULT_WS_URL;
       const bot = new BotConnection(wsUrl, args.name, '', { isGuest: true });
       try {
@@ -2112,6 +2116,8 @@ async function handleTool(name, args) {
       const r = getBot(args.name); if (r.error) return r;
       const timeoutMs = args.timeoutMs ?? 10000;
       const condition = args.condition;
+      const validConditions = ['user_joined','user_left','chat_received','notice_received','entity_added','entity_removed','user_count_gte','user_count_lte'];
+      if (!validConditions.includes(condition)) return { error: `Unknown condition: ${condition}` };
       const value = args.value;
       const deadline = Date.now() + timeoutMs;
 
@@ -2254,6 +2260,8 @@ async function handleTool(name, args) {
     }
 
     case 'bot_spawn_at': {
+      if (args.name == null || String(args.name).trim() === '') return { error: 'name is required' };
+      if (bots.has(args.name)) return { error: `Bot "${args.name}" already exists. Close it first or use a different name.` };
       const wsUrl = args.wsUrl || DEFAULT_WS_URL;
       const bot = new BotConnection(wsUrl, args.name, args.vrmUrl || '', {});
       try {
@@ -2305,6 +2313,7 @@ async function handleTool(name, args) {
         center = walkable.find(t => t.id === args.centerTileId);
         if (!center) return { error: `Center tile ${args.centerTileId} not found` };
       } else {
+        if (walkable.length === 0) return { error: 'No walkable tiles in map' };
         center = walkable.reduce((best, t) => dist2d(t, 0, 0) < dist2d(best, 0, 0) ? t : best);
       }
       const cx = center.x, cz = center.z;
@@ -2518,7 +2527,13 @@ async function handleTool(name, args) {
       };
 
       const bot = new BotConnection(wsUrl, username, '', { autoReconnect: true });
-      await bot.connect();
+      try {
+        await bot.connect();
+      } catch (err) {
+        bot.close();
+        return { error: `Failed to start conductor: ${err.message}` };
+      }
+      if (bots.has(username)) { const old = bots.get(username); old.close(); bots.delete(username); }
       bots.set(username, bot);
       conductorBot = bot;
       conductorChatCursor = bot.chatBuffer.length;
