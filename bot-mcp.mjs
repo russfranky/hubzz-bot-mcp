@@ -204,6 +204,9 @@ class BotConnection extends EventEmitter {
   connect() {
     return new Promise((resolve, reject) => {
       this.intentionallyClosed = false;
+      // L-5: close any existing socket before creating a new one — otherwise
+      // the old ws orphans with its listeners attached.
+      if (this.ws) { try { this.ws.terminate(); } catch (_) {} this.ws = null; }
       // Bug-5: track pending reject so close() can settle a connect in flight
       this._connectReject = reject;
 
@@ -744,8 +747,8 @@ class BotRTCSession {
 
     // Create audio source and start tone
     this.audioSource = new RTCAudioSource();
-    const track = this.audioSource.createTrack();
-    this.producer = await this.sendTransport.produce({ track });
+    this.track = this.audioSource.createTrack();
+    this.producer = await this.sendTransport.produce({ track: this.track });
     this._startTone();
 
     this.status = 'producing';
@@ -780,6 +783,8 @@ class BotRTCSession {
     if (this.toneTimer) { clearInterval(this.toneTimer); this.toneTimer = null; }
     if (this.producer) { try { this.producer.close(); } catch (_) {} this.producer = null; }
     if (this.sendTransport) { try { this.sendTransport.close(); } catch (_) {} this.sendTransport = null; }
+    // L-3: stop the native audio track — otherwise it holds resources per cycle
+    if (this.track) { try { this.track.stop(); } catch (_) {} this.track = null; }
     if (this.socket) { try { this.socket.disconnect(); } catch (_) {} this.socket = null; }
     this.status = 'stopped';
   }
@@ -1495,6 +1500,10 @@ async function handleTool(name, args) {
     case 'bot_close': {
       const bot = bots.get(args.name);
       if (!bot) return { error: `Bot "${args.name}" not found` };
+      // L-1: also stop the bot's RTC audio session — otherwise the socket.io
+      // connection, tone timer, and mediasoup resources orphan.
+      const sess = rtcSessions.get(args.name);
+      if (sess) { try { sess.stop(); } catch (_) {} rtcSessions.delete(args.name); }
       bot.close();
       bots.delete(args.name);
       return { status: 'closed', name: args.name };
@@ -1511,6 +1520,9 @@ async function handleTool(name, args) {
     case 'bot_close_all': {
       const names = Array.from(bots.keys());
       for (const [, bot] of bots) bot.close();
+      // L-1: stop all RTC sessions too
+      for (const [, s] of rtcSessions) { try { s.stop(); } catch (_) {} }
+      rtcSessions.clear();
       bots.clear();
       return { status: 'all_closed', closed: names };
     }
@@ -2038,9 +2050,11 @@ async function handleTool(name, args) {
     case 'bot_typing': {
       const r = getBot(args.name); if (r.error) return r;
       const typing = args.typing !== false;
+      // L-4: cancel previous auto-clear timer so rapid re-asserts don't stack
+      if (r.typingClearTimer) { clearTimeout(r.typingClearTimer); r.typingClearTimer = null; }
       r.sendTypingStatus(typing);
       if (typing && args.autoClearMs) {
-        setTimeout(() => { if (r.connected) r.sendTypingStatus(false); }, args.autoClearMs);
+        r.typingClearTimer = setTimeout(() => { r.typingClearTimer = null; if (r.connected) r.sendTypingStatus(false); }, args.autoClearMs);
       }
       return { status: 'typing_sent', name: args.name, typing, autoClearMs: args.autoClearMs || null };
     }
