@@ -12,6 +12,8 @@
 import WebSocket from 'ws';
 import { EventEmitter } from 'events';
 import https from 'https';
+import net from 'net';
+import tls from 'tls';
 import wrtcPkg from '@roamhq/wrtc';
 import { Device } from 'mediasoup-client';
 import { io } from 'socket.io-client';
@@ -48,13 +50,72 @@ const AVAILABLE_EMOTES = [
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-function fetchJson(url) {
+// HTTPS Agent that tunnels through the sandbox egress proxy via CONNECT.
+// Used by fetchJson when https_proxy/HTTPS_PROXY is set (no direct egress).
+// NOTE: Node's https module aborts responses on manually-tunneled TLS sockets
+// (see D-001 investigation). We shell out to curl for the proxy case instead,
+// which handles CONNECT tunneling reliably.
+import { execFile } from 'child_process';
+
+function fetchJsonViaCurl(url, timeoutMs) {
   return new Promise((resolve, reject) => {
-    https.get(url, res => {
+    const args = [
+      '-sS', '-f',           // silent, fail on HTTP error
+      '--proxy', process.env.https_proxy || process.env.HTTPS_PROXY,
+      '--max-time', String(Math.ceil(timeoutMs / 1000)),
+      '-L', '--max-redirs', '5',
+      url,
+    ];
+    execFile('curl', args, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        reject(new Error(`fetchJson curl failed: ${err.message} ${stderr.slice(0, 200)}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (e) {
+        reject(new Error(`fetchJson curl JSON parse failed: ${e.message}`));
+      }
+    });
+  });
+}
+
+function fetchJson(url, timeoutMs = 15000, _redirects = 0) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (err) => { if (!settled) { settled = true; reject(err); } };
+    const ok = (val) => { if (!settled) { settled = true; resolve(val); } };
+    const timeoutErr = () => new Error(`fetchJson timeout after ${timeoutMs}ms: ${url}`);
+    const timer = setTimeout(() => fail(timeoutErr()), timeoutMs);
+    const onBody = (res) => {
+      // Follow redirects (e.g. hubzz.xyz -> hubzz.app)
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        clearTimeout(timer);
+        if (_redirects >= 5) { fail(new Error(`fetchJson: too many redirects: ${url}`)); return; }
+        res.resume();
+        fetchJson(new URL(res.headers.location, url).toString(), timeoutMs, _redirects + 1).then(ok, fail);
+        return;
+      }
       let data = '';
       res.on('data', c => data += c);
-      res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
-    }).on('error', reject);
+      res.on('end', () => { clearTimeout(timer); try { ok(JSON.parse(data)); } catch (e) { fail(e); } });
+      res.on('error', (e) => { clearTimeout(timer); fail(e); });
+    };
+    const wireReq = (req) => {
+      req.on('timeout', () => { req.destroy(); fail(timeoutErr()); });
+      req.on('error', (e) => { clearTimeout(timer); fail(e); });
+    };
+
+    const proxyEnv = process.env.https_proxy || process.env.HTTPS_PROXY || '';
+    if (proxyEnv) {
+      // No direct egress: use curl for CONNECT tunneling (Node's https aborts
+      // manually-tunneled TLS sockets; see D-001). Curl handles proxy, redirects,
+      // and timeouts reliably.
+      clearTimeout(timer);
+      fetchJsonViaCurl(url, timeoutMs).then(ok, fail);
+    } else {
+      wireReq(https.get(url, { timeout: timeoutMs }, onBody));
+    }
   });
 }
 
@@ -364,7 +425,10 @@ class BotConnection extends EventEmitter {
   _bufferEvent(type, data) {
     // Always emit for waitForEvent listeners
     this.emit('_event', { type, data });
-    this.emit(type, data);
+    // 'error' is special on EventEmitters: emitting it with no listener throws
+    // ERR_UNHANDLED_ERROR and kills the server. Errors are already tracked in
+    // this.errors and buffered for subscribers, so skip the raw emit.
+    if (type !== 'error') this.emit(type, data);
     // Only store in buffer if subscribed
     if (this.eventSubscriptions.has('*') || this.eventSubscriptions.has(type)) {
       this.eventBuffer.push({ type, data, timestamp: Date.now() });
@@ -1951,6 +2015,8 @@ async function handleTool(name, args) {
       } else if (args.action === 'grant') {
         if (!args.permission) return { error: 'permission required for grant action' };
         r.sendChat(`!grant ${args.permission} ${args.target}`);
+      } else {
+        return { error: `Unknown kick_test action: ${args.action}` };
       }
       return { status: 'command_sent', action: args.action, target: args.target };
     }
@@ -2112,8 +2178,10 @@ async function handleTool(name, args) {
             actual = u?.tile ?? null;
             pass = u != null && Number(u.tile) === Number(tileId); break;
           }
-          case 'own_tile':
-            actual = r.ownTile; pass = Number(r.ownTile) === Number(value); break;
+          case 'own_tile': {
+            const expected = value ?? tileId;
+            actual = r.ownTile; pass = Number(r.ownTile) === Number(expected); break;
+          }
           case 'chat_contains': {
             const msg = r.chatBuffer.slice().reverse().find(m => m.message.includes(value));
             pass = !!msg; actual = msg?.message || null; break;
