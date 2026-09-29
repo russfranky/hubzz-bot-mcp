@@ -220,8 +220,12 @@ class BotConnection extends EventEmitter {
 
       this.ws.on('close', () => {
         clearTimeout(this.connectionTimeout);
+        this._stopKeepalive();
         const wasConnected = this.connected;
         this.connected = false;
+        // Clear stale world state (re-populates via w:add on reconnect)
+        this.knownUsers.clear();
+        this.entities.clear();
         if (wasConnected) this.disconnectCount++;
         this._bufferEvent('disconnect', { wasConnected, intentional: this.intentionallyClosed });
         this.emit('disconnected');
@@ -307,7 +311,7 @@ class BotConnection extends EventEmitter {
       }
 
       case 'w:move': {
-        const [userId, tileId] = msg.a;
+        const [userId, tileId] = msg.a || [];
         const user = this.knownUsers.get(String(userId));
         if (user) user.tile = Number(tileId);
         this._bufferEvent('w:move', { userId, tileId });
@@ -315,7 +319,7 @@ class BotConnection extends EventEmitter {
       }
 
       case 'chat': {
-        const [userId, message] = msg.a;
+        const [userId, message] = msg.a || [];
         const user = this.knownUsers.get(String(userId));
         const entry = {
           userId: String(userId),
@@ -474,7 +478,9 @@ class BotConnection extends EventEmitter {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data) + DELIMITER);
       this.messageCount.sent++;
+      return true;
     }
+    return false;
   }
 
   // --- Keepalive ---
