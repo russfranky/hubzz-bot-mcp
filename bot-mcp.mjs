@@ -630,6 +630,8 @@ class BotConnection extends EventEmitter {
     this._stopKeepalive();
     clearTimeout(this.connectionTimeout);
     clearTimeout(this.reconnectTimeout);
+    if (this.toneTimer) { clearInterval(this.toneTimer); this.toneTimer = null; }
+    if (this.typingClearTimer) { clearTimeout(this.typingClearTimer); this.typingClearTimer = null; }
     if (this.ws) {
       this.ws.close();
       this.ws = null;
