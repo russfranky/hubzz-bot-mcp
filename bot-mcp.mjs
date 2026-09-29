@@ -2505,9 +2505,15 @@ async function handleTool(name, args) {
           await sleep(200);
           bot._send({ h: 'voiceState', a: [true] });
           await sleep(500);
-          const session = new BotRTCSession(cfg.name, roomId, voiceServerBase, cfg.freq, cfg.gain);
-          await session.start(cfg.freq, cfg.gain);
-          rtcSessions.set(cfg.name, session);
+          let audioSession = null;
+          try {
+            audioSession = new BotRTCSession(cfg.name, roomId, voiceServerBase, cfg.freq, cfg.gain);
+            await audioSession.start(cfg.freq, cfg.gain);
+          } catch (audioErr) {
+            if (audioSession) { try { audioSession.stop(); } catch (_) {} }
+            throw audioErr;
+          }
+          rtcSessions.set(cfg.name, audioSession);
           setupResults.push({ name: cfg.name, tileId: cfg.tileId, freq: cfg.freq, status: 'ready' });
         } catch (err) {
           const b = bots.get(cfg.name);
