@@ -1656,6 +1656,7 @@ async function handleTool(name, args) {
 
     case 'bot_dance': {
       const r = getBot(args.name); if (r.error) return r;
+      if (args.animation == null || String(args.animation).trim() === '') return { error: 'animation is required' };
       if (!/^[a-zA-Z0-9_]+$/.test(args.animation)) return { error: 'Animation name must be alphanumeric + underscore' };
       if (args.useChat) {
         r.sendChat(`!anim ${args.animation}`);
