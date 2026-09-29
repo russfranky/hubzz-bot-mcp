@@ -233,11 +233,11 @@ class BotConnection extends EventEmitter {
         const raw = data.toString();
         const parts = raw.split(DELIMITER).filter(m => m.length > 0);
         for (const part of parts) {
-          try {
-            const msg = JSON.parse(part);
-            this.messageCount.received++;
-            this._handleMessage(msg, resolve, reject);
-          } catch (_) { /* skip unparseable */ }
+          let msg;
+          try { msg = JSON.parse(part); }
+          catch (_) { continue; } // skip unparseable frames only
+          this.messageCount.received++;
+          this._handleMessage(msg, resolve, reject);
         }
       });
 
@@ -257,7 +257,7 @@ class BotConnection extends EventEmitter {
         if (!this.intentionallyClosed && this.autoReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
           this.reconnectAttempts++;
           const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-          this.reconnectTimeout = setTimeout(() => this.connect().catch(() => {}), delay);
+          this.reconnectTimeout = setTimeout(() => this.connect().catch((err) => this._trackError('reconnect_failed', err.message)), delay);
         }
       });
 
@@ -475,7 +475,10 @@ class BotConnection extends EventEmitter {
       }, timeoutMs);
 
       const handler = (data) => {
-        if (!matchFn || matchFn(data)) {
+        let ok = false;
+        try { ok = !matchFn || matchFn(data); }
+        catch (e) { clearTimeout(timer); off?.(); reject(e); return; }
+        if (ok) {
           clearTimeout(timer);
           off?.();
           resolve({ type, data, timestamp: Date.now() });
@@ -777,7 +780,7 @@ class BotRTCSession {
     if (this.toneTimer) { clearInterval(this.toneTimer); this.toneTimer = null; }
     if (this.producer) { try { this.producer.close(); } catch (_) {} this.producer = null; }
     if (this.sendTransport) { try { this.sendTransport.close(); } catch (_) {} this.sendTransport = null; }
-    if (this.socket) { this.socket.disconnect(); this.socket = null; }
+    if (this.socket) { try { this.socket.disconnect(); } catch (_) {} this.socket = null; }
     this.status = 'stopped';
   }
 
@@ -2103,6 +2106,7 @@ async function handleTool(name, args) {
 
       let matchFn = null;
       if (args.matchField != null && args.matchValue != null) {
+        if (typeof args.matchField !== 'string') return { error: 'matchField must be a string' };
         const fieldPath = args.matchField.split('.');
         matchFn = (data) => {
           let val = data;
@@ -2124,7 +2128,7 @@ async function handleTool(name, args) {
 
     case 'bot_upload': {
       const r = getBot(args.name); if (r.error) return r;
-      const filename = args.filename || 'test.png';
+      const filename = String(args.filename || 'test.png');
       const ext = filename.split('.').pop().toLowerCase();
 
       // Minimal valid test files as base64
