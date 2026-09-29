@@ -1995,6 +1995,7 @@ async function handleTool(name, args) {
 
     case 'bot_emote_loop': {
       const r = getBot(args.name); if (r.error) return r;
+      if (args.animation == null || String(args.animation).trim() === '') return { error: 'animation is required' };
       const loop = args.loop !== false;
       r._send({ h: 'emote', a: [args.animation, loop] });
       return { status: 'emote_sent', name: args.name, animation: args.animation, loop };
