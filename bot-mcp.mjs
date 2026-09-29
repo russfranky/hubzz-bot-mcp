@@ -533,7 +533,7 @@ class BotConnection extends EventEmitter {
   // --- Actions ---
 
   moveToTile(tileId) { this._send({ h: 'w:move', a: [tileId] }); }
-  sendChat(message) { this._send({ h: 'chat', a: [message] }); }
+  sendChat(message) { return this._send({ h: 'chat', a: [message] }); }
   sendEmote(animation) { this._send({ h: 'emote', a: [animation, false] }); }
   sendRotation(x, y, z) { this._send({ h: 'w:rot', a: [{ x, y, z }] }); }
   sendLookAt(x, y, z) { this._send({ h: 'w:lookAt', a: [{ x, y, z }] }); }
@@ -1475,7 +1475,8 @@ async function handleTool(name, args) {
     case 'bot_chat': {
       const r = getBot(args.name); if (r.error) return r;
       if (args.message == null || String(args.message).trim() === '') return { error: 'message is required' };
-      r.sendChat(args.message);
+      const sent = r.sendChat(args.message);
+      if (!sent) return { error: 'not connected: message not sent' };
       return { status: 'sent', name: args.name, message: args.message };
     }
 
@@ -2174,10 +2175,12 @@ async function handleTool(name, args) {
       const r = getBot(args.name); if (r.error) return r;
       if (args.action === 'play') {
         if (!args.url) return { error: 'url required for play action' };
-        r.sendChat(`--play ${args.url}`);
+        const sent = r.sendChat(`--play ${args.url}`);
+        if (!sent) return { error: 'not connected: play command not sent' };
         return { status: 'play_sent', url: args.url };
       } else if (args.action === 'stop') {
-        r.sendChat('--stop');
+        const sent = r.sendChat('--stop');
+        if (!sent) return { error: 'not connected: stop command not sent' };
         return { status: 'stop_sent' };
       } else if (args.action === 'call') {
         if (!args.entityId || !args.method) return { error: 'entityId and method required for call action' };
