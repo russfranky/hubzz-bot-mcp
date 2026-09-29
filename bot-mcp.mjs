@@ -1608,7 +1608,9 @@ async function handleTool(name, args) {
     }
 
     case 'bot_stress_test': {
-      const count = Math.min(Math.max(1, args.count || 1), MAX_BATCH_SIZE);
+      const rawCount = args.count == null ? 1 : Number(args.count);
+      if (!Number.isFinite(rawCount) || rawCount < 1) return { error: 'count must be a positive number' };
+      const count = Math.min(Math.max(1, rawCount), MAX_BATCH_SIZE);
       const durationSec = Math.min(Math.max(1, args.durationSec || 10), MAX_STRESS_DURATION);
       const mps = Math.min(Math.max(0.1, args.messagesPerSec || 1), 5);
       const wsCheck = validateWsUrl(args.wsUrl);
