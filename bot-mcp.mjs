@@ -1439,6 +1439,7 @@ async function handleTool(name, args) {
     case 'bot_voice': {
       const r = getBot(args.name); if (r.error) return r;
       const state = args.state ?? args.voiceState ?? true;
+      if (typeof state !== 'boolean') return { error: 'state (boolean) is required' };
       r._send({ h: 'voiceState', a: [state] });
       return { status: 'voice_toggled', name: args.name, state };
     }
@@ -1479,9 +1480,10 @@ async function handleTool(name, args) {
       const wsUrl = args.wsUrl || DEFAULT_WS_URL;
       const results = [];
       const startTime = Date.now();
+      const prefix = args.prefix ?? 'bot';
 
       for (let i = 0; i < count; i++) {
-        const botName = `${args.prefix}-${i}`;
+        const botName = `${prefix}-${i}`;
         if (bots.has(botName)) {
           results.push({ name: botName, status: 'skipped', error: 'already exists' });
           continue;
@@ -1538,7 +1540,7 @@ async function handleTool(name, args) {
         return { status: 'patrolling', name: args.name, index: r.patrolRoute.index, total: r.patrolRoute.tiles.length, loop: r.patrolRoute.loop };
       }
       // start
-      if (!args.tiles || args.tiles.length === 0) return { error: 'tiles array is required for start action' };
+      if (!Array.isArray(args.tiles) || args.tiles.length === 0 || args.tiles.some(t => !Number.isFinite(Number(t)))) return { error: 'tiles must be an array of numeric tile IDs' };
       r.startPatrol(args.tiles, args.intervalMs || 2000, args.loop !== false);
       return { status: 'patrolling', name: args.name, tiles: args.tiles.length, intervalMs: args.intervalMs || 2000, loop: args.loop !== false };
     }
@@ -1988,8 +1990,9 @@ async function handleTool(name, args) {
 
     case 'bot_rotate': {
       const r = getBot(args.name); if (r.error) return r;
-      let x = args.x ?? 0, y = args.y ?? 0, z = args.z ?? 0;
-      if (args.yaw != null) y = (args.yaw * Math.PI) / 180;
+      let x = Number(args.x ?? 0), y = Number(args.y ?? 0), z = Number(args.z ?? 0);
+      if (args.yaw != null) y = (Number(args.yaw) * Math.PI) / 180;
+      if (![x, y, z].every(Number.isFinite)) return { error: 'x/y/z/yaw must be numbers' };
       r.sendRotation(x, y, z);
       r.ownRotation = { x, y, z };
       return { status: 'rotated', name: args.name, rotation: { x, y, z }, yawDeg: args.yaw ?? null };
