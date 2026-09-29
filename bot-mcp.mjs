@@ -204,6 +204,8 @@ class BotConnection extends EventEmitter {
   connect() {
     return new Promise((resolve, reject) => {
       this.intentionallyClosed = false;
+      // Bug-5: track pending reject so close() can settle a connect in flight
+      this._connectReject = reject;
 
       try {
         this.ws = new WebSocket(this.wsUrl);
@@ -288,12 +290,14 @@ class BotConnection extends EventEmitter {
         this.reconnectAttempts = 0;
         this._startKeepalive();
         this.emit('ready');
+        this._connectReject = null;
         if (resolve) resolve();
         break;
 
       case 'acc:fail':
         clearTimeout(this.connectionTimeout);
         this._trackError('auth', JSON.stringify(msg.a));
+        this._connectReject = null;
         if (reject) reject(new Error(`Login failed: ${JSON.stringify(msg.a)}`));
         break;
 
@@ -610,6 +614,12 @@ class BotConnection extends EventEmitter {
 
   close() {
     this.intentionallyClosed = true;
+    // Bug-5: settle a pending connect() so awaiters don't hang forever
+    if (this._connectReject) {
+      const r = this._connectReject;
+      this._connectReject = null;
+      r(new Error('Connection closed'));
+    }
     this.stopPatrol();
     this._stopKeepalive();
     clearTimeout(this.connectionTimeout);
@@ -634,6 +644,7 @@ const rtcSessions = new Map();
 // Conductor state
 let conductorBot = null;
 let conductorInterval = null;
+let conductorGen = 0; // Bug-3: generation counter — concurrent starts supersede older ones
 let conductorConfig = {
   firstPerson: { refDistance: 1, rolloffFactor: 0.75, distanceModel: 'exponential', volume: 1.0 },
   isometric: { volume: 1.0 },
@@ -679,9 +690,9 @@ class BotRTCSession {
 
     this.socket = io(RTC_SERVER, { transports: ['websocket'] });
     await new Promise((resolve, reject) => {
-      this.socket.on('connect', resolve);
-      this.socket.on('connect_error', e => reject(new Error(`Socket.IO connect error: ${e.message}`)));
-      setTimeout(() => reject(new Error('Socket.IO connection timed out')), 8000);
+      const t = setTimeout(() => reject(new Error('Socket.IO connection timed out')), 8000);
+      this.socket.on('connect', () => { clearTimeout(t); resolve(); });
+      this.socket.on('connect_error', e => { clearTimeout(t); reject(new Error(`Socket.IO connect error: ${e.message}`)); });
     });
 
     await this.socketRequest('join', {
@@ -1520,11 +1531,14 @@ async function handleTool(name, args) {
           continue;
         }
         const bot = new BotConnection(wsUrl, botName, args.vrmUrl || '', { autoReconnect: args.autoReconnect || false });
+        // Bug-2: reserve the name BEFORE the await gap so concurrent spawns
+        // can't both pass the bots.has() check and create a ghost.
+        bots.set(botName, bot);
         try {
           await bot.connect();
-          bots.set(botName, bot);
           results.push({ name: botName, status: 'connected' });
         } catch (err) {
+          bots.delete(botName);
           bot.close();
           results.push({ name: botName, status: 'failed', error: err.message });
         }
@@ -1624,7 +1638,7 @@ async function handleTool(name, args) {
       const timers = [];
       const testStart = Date.now();
 
-      for (const bot of testBots) {
+      for (const { bot } of testBots) {
         const timer = setInterval(() => {
           if (!bot.connected) { metrics.droppedConnections++; return; }
           try {
@@ -2586,8 +2600,12 @@ async function handleTool(name, args) {
     }
 
     case 'bot_conductor_start': {
-      const wsUrl = args.wsUrl || 'wss://hubzz.xyz/socket/0,0/';
+      const wsCheck2 = validateWsUrl(args.wsUrl);
+      if (wsCheck2.error) return wsCheck2;
+      const wsUrl = wsCheck2.wsUrl || 'wss://hubzz.xyz/socket/0,0/';
       const username = args.username || 'conductor';
+      // Bug-3: capture generation before the async gap
+      const myGen = ++conductorGen;
 
       // Stop any existing conductor
       if (conductorInterval) {
@@ -2610,6 +2628,11 @@ async function handleTool(name, args) {
       } catch (err) {
         bot.close();
         return { error: `Failed to start conductor: ${err.message}` };
+      }
+      // Bug-3: if a newer start superseded us during the await, clean up and bail
+      if (myGen !== conductorGen) {
+        bot.close();
+        return { error: 'Conductor start superseded by newer start' };
       }
       if (bots.has(username)) { const old = bots.get(username); old.close(); bots.delete(username); }
       bots.set(username, bot);
