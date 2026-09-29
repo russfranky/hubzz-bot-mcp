@@ -2275,19 +2275,21 @@ async function handleTool(name, args) {
     case 'bot_spawn_at': {
       if (args.name == null || String(args.name).trim() === '') return { error: 'name is required' };
       if (bots.has(args.name)) return { error: `Bot "${args.name}" already exists. Close it first or use a different name.` };
+      const spawnTileId = Number(args.tileId);
+      if (!Number.isFinite(spawnTileId)) return { error: `Invalid tileId: ${args.tileId}` };
       const wsUrl = args.wsUrl || DEFAULT_WS_URL;
       const bot = new BotConnection(wsUrl, args.name, args.vrmUrl || '', {});
       try {
         await bot.connect();
         bots.set(args.name, bot);
         await sleep(300);
-        bot.moveToTile(args.tileId);
-        bot.ownTile = args.tileId;
+        bot.moveToTile(spawnTileId);
+        bot.ownTile = spawnTileId;
         if (args.voiceOn) {
           await sleep(200);
           bot._send({ h: 'voiceState', a: [true] });
         }
-        return { status: 'ready', name: args.name, tileId: args.tileId, voiceOn: !!args.voiceOn };
+        return { status: 'ready', name: args.name, tileId: spawnTileId, voiceOn: !!args.voiceOn };
       } catch (err) {
         bot.close();
         bots.delete(args.name);
@@ -2383,9 +2385,15 @@ async function handleTool(name, args) {
             const urlObj = new URL(wsUrl);
             const worldPath = urlObj.pathname.replace(/^\/socket\//, '').replace(/\/$/, '') || '0,0';
             const roomId = `${urlObj.hostname}@${worldPath}`;
-            const session = new BotRTCSession(botName, roomId, `https://${urlObj.hostname}`, freq, gain);
-            await session.start(freq, gain);
-            rtcSessions.set(botName, session);
+            let session = null;
+            try {
+              session = new BotRTCSession(botName, roomId, `https://${urlObj.hostname}`, freq, gain);
+              await session.start(freq, gain);
+              rtcSessions.set(botName, session);
+            } catch (audioErr) {
+              if (session) { try { session.stop(); } catch (_) {} }
+              throw audioErr;
+            }
           }
 
           ringResults.push({ name: botName, direction: dir, tileId: best.id, actualDist, freq, gain, status: 'ready', audioStarted: startAudio });
@@ -2455,6 +2463,8 @@ async function handleTool(name, args) {
         return { action: 'setup_ring', ring: ringResult, conductor: condResult };
       }
 
+      if (!['setup', 'teardown', 'status', 'setup_ring'].includes(action)) return { error: `Unknown scene_audio action: ${args.action}` };
+
       // Default: 'setup' — distance-based test
       if (conductorInterval) { clearInterval(conductorInterval); conductorInterval = null; }
       if (conductorBot) { const n = conductorBot.username; conductorBot.close(); bots.delete(n); conductorBot = null; }
@@ -2491,6 +2501,8 @@ async function handleTool(name, args) {
           rtcSessions.set(cfg.name, session);
           setupResults.push({ name: cfg.name, tileId: cfg.tileId, freq: cfg.freq, status: 'ready' });
         } catch (err) {
+          const b = bots.get(cfg.name);
+          if (b) { b.close(); bots.delete(cfg.name); }
           setupResults.push({ name: cfg.name, status: 'failed', error: err.message });
         }
         await sleep(500);
@@ -2529,8 +2541,7 @@ async function handleTool(name, args) {
         conductorInterval = null;
       }
       if (conductorBot) {
-        conductorBot.close();
-        conductorBot = null;
+        const n = conductorBot.username; conductorBot.close(); bots.delete(n); conductorBot = null;
       }
 
       // Reset config to defaults
