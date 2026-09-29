@@ -1396,6 +1396,7 @@ async function handleTool(name, args) {
 
     case 'bot_spawn': {
       const botName = args.name;
+      if (botName == null || String(botName).trim() === '') return { error: 'name is required' };
       if (bots.has(botName)) return { error: `Bot "${botName}" already exists. Close it first or use a different name.` };
       const wsUrl = args.wsUrl || DEFAULT_WS_URL;
       const bot = new BotConnection(wsUrl, botName, args.vrmUrl || '', { autoReconnect: args.autoReconnect || false, token: args.token });
@@ -1428,6 +1429,7 @@ async function handleTool(name, args) {
 
     case 'bot_emote': {
       const r = getBot(args.name); if (r.error) return r;
+      if (args.animation == null || String(args.animation).trim() === '') return { error: 'animation is required' };
       r.sendEmote(args.animation);
       return { status: 'emote_sent', name: args.name, animation: args.animation };
     }
