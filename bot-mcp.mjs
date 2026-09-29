@@ -1919,6 +1919,7 @@ async function handleTool(name, args) {
 
     case 'bot_audio_start': {
       const botName = args.name;
+      const r = getBot(botName); if (r.error) return r;
       if (rtcSessions.has(botName)) return { error: `Bot "${botName}" already has an active audio session. Use bot_audio_stop first.` };
 
       // Derive room_id from wsUrl: wss://hubzz.xyz/socket/0,0/ → hubzz.xyz@0,0
