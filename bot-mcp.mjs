@@ -1412,13 +1412,16 @@ async function handleTool(name, args) {
 
     case 'bot_move': {
       const r = getBot(args.name); if (r.error) return r;
-      r.moveToTile(args.tileId);
-      r.ownTile = args.tileId;
-      return { status: 'moved', name: args.name, tileId: args.tileId };
+      const tileId = Number(args.tileId);
+      if (!Number.isFinite(tileId)) return { error: `Invalid tileId: ${args.tileId}` };
+      r.moveToTile(tileId);
+      r.ownTile = tileId;
+      return { status: 'moved', name: args.name, tileId };
     }
 
     case 'bot_chat': {
       const r = getBot(args.name); if (r.error) return r;
+      if (args.message == null || String(args.message).trim() === '') return { error: 'message is required' };
       r.sendChat(args.message);
       return { status: 'sent', name: args.name, message: args.message };
     }
