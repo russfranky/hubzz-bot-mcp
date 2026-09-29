@@ -174,6 +174,7 @@ class BotConnection extends EventEmitter {
     this.autoReconnect = opts.autoReconnect || false;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 5;
+    this.reconnectTimeout = null;
 
     // Keepalive ping (nginx default timeout is 60s)
     this.keepaliveTimer = null;
@@ -229,7 +230,7 @@ class BotConnection extends EventEmitter {
         if (!this.intentionallyClosed && this.autoReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
           this.reconnectAttempts++;
           const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-          setTimeout(() => this.connect().catch(() => {}), delay);
+          this.reconnectTimeout = setTimeout(() => this.connect().catch(() => {}), delay);
         }
       });
 
@@ -585,6 +586,7 @@ class BotConnection extends EventEmitter {
     this.stopPatrol();
     this._stopKeepalive();
     clearTimeout(this.connectionTimeout);
+    clearTimeout(this.reconnectTimeout);
     if (this.ws) {
       this.ws.close();
       this.ws = null;
