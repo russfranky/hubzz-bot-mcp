@@ -211,7 +211,15 @@ class BotConnection extends EventEmitter {
       this._connectReject = reject;
 
       try {
-        this.ws = new WebSocket(this.wsUrl);
+        // Allow self-signed certs for localhost/127.0.0.1 relay (dev/QA only)
+        const wsOpts = {};
+        try {
+          const u = new URL(this.wsUrl);
+          if (u.hostname === '127.0.0.1' || u.hostname === 'localhost') {
+            wsOpts.rejectUnauthorized = false;
+          }
+        } catch (_) {}
+        this.ws = new WebSocket(this.wsUrl, wsOpts);
       } catch (err) {
         this._trackError('ws_create', err.message);
         reject(new Error(`Failed to create WebSocket: ${err.message}`));
