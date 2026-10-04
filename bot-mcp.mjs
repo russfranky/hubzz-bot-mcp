@@ -13,6 +13,15 @@ import WebSocket from 'ws';
 import { EventEmitter } from 'events';
 import https from 'https';
 import net from 'net';
+
+// True when run directly (node bot-mcp.mjs), false when imported for unit
+// tests. Server-only side effects (token check, stdin loop) are gated on this.
+const isMainModule = (() => {
+  try {
+    const mainPath = process.argv[1] || '';
+    return mainPath !== '' && (mainPath.endsWith('/bot-mcp.mjs') || mainPath.endsWith('\\bot-mcp.mjs'));
+  } catch { return true; }
+})();
 import tls from 'tls';
 import wrtcPkg from '@roamhq/wrtc';
 import { Device } from 'mediasoup-client';
@@ -29,7 +38,10 @@ globalThis.MediaStreamTrack = MediaStreamTrack;
 
 // --- Configuration ---
 
-const DEFAULT_WS_URL = process.env.HUBZZ_WS_URL || 'wss://hubzz.xyz/socket/';
+const DEFAULT_WS_URL = process.env.HUBZZ_WS_URL || 'wss://hubzz.app/socket/';
+// Cherry-picked from archived russfranky/hubzz-alpha (packages/bot-mcp): the
+// server_* tools query the Hubzz HTTP API. Default points at production.
+const DEFAULT_API_URL = process.env.HUBZZ_API_URL || 'https://hubzz.app';
 // S-001: wsUrl allowlist — the real HUBZZ_BOT_TOKEN is sent in the login frame,
 // so never connect to an arbitrary host. Returns error string or null.
 const WS_URL_ALLOWLIST = ['hubzz.xyz', 'hubzz.app', 'localhost', '127.0.0.1'];
@@ -43,7 +55,9 @@ function validateWsUrl(raw) {
   return { wsUrl };
 }
 const BOT_TOKEN = process.env.HUBZZ_BOT_TOKEN;
-if (!BOT_TOKEN) { console.error('[bot-mcp] HUBZZ_BOT_TOKEN env var is required'); process.exit(1); }
+// The token is only required when running as the MCP server, not when
+// imported for unit tests.
+if (!BOT_TOKEN && isMainModule) { console.error('[bot-mcp] HUBZZ_BOT_TOKEN env var is required'); process.exit(1); }
 const DELIMITER = '\uF8FF';
 const MAX_CHAT_BUFFER = 50;
 const MAX_EVENT_BUFFER = 200;
@@ -140,10 +154,182 @@ function fetchJson(url, timeoutMs = 15000, _redirects = 0) {
   });
 }
 
+// HTTP GET returning { status, body } without throwing on non-2xx — used by the
+// server_* tools cherry-picked from archived russfranky/hubzz-alpha. Same S-002
+// URL validation as fetchJsonViaCurl: http(s) only, '--' end-of-options.
+function httpGetJson(url, timeoutMs = 30000, retries = 2) {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try { parsed = new URL(url); }
+    catch (_) { reject(new Error('httpGetJson: invalid URL')); return; }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      reject(new Error('httpGetJson: only http(s) URLs allowed')); return;
+    }
+    const attempt = (n) => {
+      const args = [
+        '-sS',
+        '--proxy', process.env.https_proxy || process.env.HTTPS_PROXY,
+        '--max-time', String(Math.ceil(timeoutMs / 1000)),
+        '-L', '--max-redirs', '5',
+        '-w', '\n%{http_code}',
+        '--',
+        url,
+      ];
+      execFile('curl', args, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err) {
+          if (n < retries) { setTimeout(() => attempt(n + 1), 1500 * n); return; }
+          reject(new Error(`httpGetJson curl failed: ${err.message} ${String(stderr).slice(0, 200)}`));
+          return;
+        }
+        const idx = stdout.lastIndexOf('\n');
+        const status = Number(stdout.slice(idx + 1).trim());
+        const rawBody = stdout.slice(0, idx);
+        let body = null;
+        try { body = rawBody ? JSON.parse(rawBody) : null; }
+        catch (_) { body = { _raw: rawBody.slice(0, 2000) }; }
+        resolve({ status: Number.isFinite(status) ? status : 0, body });
+      });
+    };
+    attempt(1);
+  });
+}
+
 // Exponential falloff gain: (refDistance / max(refDistance, d))^rolloffFactor
 function spatialGain(d, refDistance = 1, rolloffFactor = 0.75) {
   if (d <= 0) return 1;
   return Math.pow(refDistance / Math.max(refDistance, d), rolloffFactor);
+}
+
+// --- Sonar / navigation helpers (bot_sonar, bot_navigate) ---
+
+// In-memory world-map cache keyed by mapUrl.
+const mapCache = new Map();
+async function getCachedMap(mapUrl, retries = 3) {
+  if (mapCache.has(mapUrl)) return mapCache.get(mapUrl);
+  // The egress proxy is slow and flaky: retry with backoff, and fall back to
+  // the canonical hubzz.app host if the hubzz.xyz URL keeps failing.
+  const urls = [mapUrl];
+  if (mapUrl.includes('hubzz.xyz')) urls.push(mapUrl.replace('hubzz.xyz', 'hubzz.app'));
+  let lastErr = null;
+  for (const u of urls) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        const data = await fetchJson(u, 45000);
+        const tiles = Object.values(data.tiles || {});
+        const walkable = tiles.filter(t => t.walkable);
+        const byId = new Map();
+        for (const t of tiles) byId.set(Number(t.id), t);
+        // Seat objects (chairs etc.) live in data.objects with a tile id.
+        const seats = Array.isArray(data.objects)
+          ? data.objects.filter(o => o && o.tile != null).map(o => ({
+              name: o.name || o.type || 'seat',
+              type: o.type || 'seat',
+              tile: Number(o.tile),
+            }))
+          : [];
+        const entry = { tiles, walkable, byId, seats };
+        mapCache.set(mapUrl, entry);
+        return entry;
+      } catch (e) {
+        lastErr = e;
+        await sleep(1000 * attempt);
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// Compass convention matches bot_find_tiles: 0 deg = East (+X), 90 = North (-Z).
+function bearingFromDelta(dx, dz) {
+  return (Math.atan2(-dz, dx) * 180 / Math.PI + 360) % 360;
+}
+function compassFromDelta(dx, dz) {
+  const dirs = ['E', 'NE', 'N', 'NW', 'W', 'SW', 'S', 'SE'];
+  return dirs[Math.round(bearingFromDelta(dx, dz) / 45) % 8];
+}
+// Server rotation: {x: pitch, y: yaw, z: 0} where yaw = atan2(dir.x, dir.z).
+// Facing vector is (sin(yaw), cos(yaw)) in (x, z). Returns a compass label
+// like "SE" or null when the rotation is unknown.
+export function facingFromRotation(rot) {
+  if (!rot || !Number.isFinite(rot.y)) return null;
+  return compassFromDelta(Math.sin(rot.y), Math.cos(rot.y));
+}
+// Mirrors server moveTiming.ts: per-step duration scales with segment length
+// so diagonal steps take √2× the base. baseStepMs 500 (250 when boosted).
+export function stepDurationMs(from, to, baseStepMs, tileSize = 2) {
+  const dist = Math.hypot(to.x - from.x, to.z - from.z);
+  const size = tileSize || 2;
+  return Math.max(1, Math.round(baseStepMs * (dist / size)));
+}
+export { bearingFromDelta, compassFromDelta, dist2 };
+function dist2(ax, az, bx, bz) {
+  return Math.hypot(ax - bx, az - bz);
+}
+function nearestWalkableTile(walkable, x, z) {
+  let best = null, bd = Infinity;
+  for (const t of walkable) {
+    const d = dist2(t.x, t.z, x, z);
+    if (d < bd) { bd = d; best = t; }
+  }
+  return best;
+}
+
+// A* over walkable tiles, 8-connected (neighbor dist <= 3.0 catches diagonals on
+// the 2-unit tile grid). Extra nodes (start/goal) may be non-walkable.
+function astarPath(walkable, byId, startTile, goalTile) {
+  const nodes = new Map();
+  const nodeFor = (t) => {
+    const id = Number(t.id);
+    if (!nodes.has(id)) nodes.set(id, { tile: t, neighbors: [] });
+    return nodes.get(id);
+  };
+  for (const t of walkable) nodeFor(t);
+  nodeFor(startTile); nodeFor(goalTile);
+  const all = [...nodes.values()];
+  for (let i = 0; i < all.length; i++) {
+    for (let j = i + 1; j < all.length; j++) {
+      const a = all[i].tile, b = all[j].tile;
+      if (dist2(a.x, a.z, b.x, b.z) <= 3.0) {
+        all[i].neighbors.push(all[j]);
+        all[j].neighbors.push(all[i]);
+      }
+    }
+  }
+  const startId = Number(startTile.id), goalId = Number(goalTile.id);
+  const h = (n) => dist2(n.tile.x, n.tile.z, goalTile.x, goalTile.z);
+  const open = [nodes.get(startId)];
+  const gScore = new Map([[startId, 0]]);
+  const cameFrom = new Map();
+  const closed = new Set();
+  while (open.length > 0) {
+    let bi = 0;
+    for (let i = 1; i < open.length; i++) {
+      const f = (gScore.get(Number(open[i].tile.id)) ?? Infinity) + h(open[i]);
+      const bf = (gScore.get(Number(open[bi].tile.id)) ?? Infinity) + h(open[bi]);
+      if (f < bf) bi = i;
+    }
+    const cur = open.splice(bi, 1)[0];
+    const curId = Number(cur.tile.id);
+    if (curId === goalId) {
+      const path = [cur.tile];
+      let c = curId;
+      while (cameFrom.has(c)) { c = cameFrom.get(c); path.unshift(nodes.get(c).tile); }
+      return path;
+    }
+    if (closed.has(curId)) continue;
+    closed.add(curId);
+    for (const nb of cur.neighbors) {
+      const nbId = Number(nb.tile.id);
+      if (closed.has(nbId)) continue;
+      const tentative = (gScore.get(curId) ?? Infinity) + dist2(cur.tile.x, cur.tile.z, nb.tile.x, nb.tile.z);
+      if (tentative < (gScore.get(nbId) ?? Infinity)) {
+        cameFrom.set(nbId, curId);
+        gScore.set(nbId, tentative);
+        if (!open.includes(nb)) open.push(nb);
+      }
+    }
+  }
+  return null;
 }
 
 // --- Bot Connection ---
@@ -167,6 +353,16 @@ class BotConnection extends EventEmitter {
     this.ownTile = null;
     this.ownPosition = null;
     this.ownRotation = null;
+    // ownUserId: the bot's server-side user id, learned from the arrival echo
+    // of the first w:move we send (the server broadcasts our steps back),
+    // or from the serverUsernameHint at spawn.
+    this.ownUserId = null;
+    this.serverUsernameHint = null;
+    // _pendingMove: {tile, sentAt, resolve} while we wait for an arrival echo.
+    this._pendingMove = null;
+    // _pendingAvatar: {vrmUrl, sentAt, timer, resolve} while waiting for
+    // setAvatar:ok / setAvatar:failed after a setAvatar send.
+    this._pendingAvatar = null;
 
     // Timing / health
     this.connectedAt = null;
@@ -332,7 +528,19 @@ class BotConnection extends EventEmitter {
           position: data.position || null,
           rotation: data.rotation || null,
           animation: data.animation || null,
+          avatarPath: data.path || null,
+          avatarCollection: data.collection || null,
+          avatarThumb: data.thumb || null,
+          isBot: data.isBot === true,
+          afkState: data.afkState || null,
+          lastSeen: Date.now(),
         });
+        // Self-identification: if the spawner told us our server-side username
+        // (the token account's name, e.g. "cado"), this entry is us. That gives
+        // us our true starting position on a fresh connection.
+        if (this.serverUsernameHint && String(userName) === this.serverUsernameHint) {
+          this.ownUserId = String(userId);
+        }
         this._bufferEvent('w:add', { userId, userName, type });
         break;
       }
@@ -347,10 +555,52 @@ class BotConnection extends EventEmitter {
       }
 
       case 'w:move': {
-        const [userId, tileId] = msg.a || [];
-        const user = this.knownUsers.get(String(userId));
-        if (user) user.tile = Number(tileId);
-        this._bufferEvent('w:move', { userId, tileId });
+        const data = msg.a?.[0];
+        if (data == null) break;
+        // Real server broadcast format: {id, g, t, st, s, r} where t = step tile id,
+        // st = true on the final step (arrival), s = step duration ms (500 orth / 707 diag).
+        // (Older guess was [userId, tileId]; keep a fallback for it.)
+        let userId, tileId, arrived, stepMs;
+        if (typeof data === 'object' && data.t != null) {
+          userId = String(data.id);
+          tileId = Number(data.t);
+          arrived = data.st === true;
+          stepMs = Number(data.s) || null;
+        } else {
+          userId = String(data);
+          tileId = Number(msg.a?.[1]);
+          arrived = false;
+          stepMs = null;
+        }
+        const user = this.knownUsers.get(userId);
+        if (user) {
+          user.tile = tileId;
+          user.lastSeen = Date.now();
+          // data.r is the server rotation {x:pitch, y:yaw, z:0} — the facing
+          // direction. Track it so sonar can report who faces whom.
+          if (data && typeof data === 'object' && data.r) user.rotation = data.r;
+        }
+        // Self tracking: the server echoes our own steps. Learn our user id
+        // from the arrival echo of a move we sent, then track every own step.
+        // ownTile stays accurate without any time estimates.
+        const pending = this._pendingMove;
+        const isSelf = (this.ownUserId && userId === this.ownUserId) ||
+          (pending && arrived && tileId === pending.tile);
+        if (isSelf) {
+          if (!this.ownUserId) this.ownUserId = userId;
+          this.ownTile = tileId;
+          if (pending) pending.seenEcho = true;
+          if (arrived && pending && pending.tile === tileId) {
+            this._pendingMove = null;
+            if (pending.resolve) pending.resolve({ tileId, userId, moved: true });
+          } else if (arrived && pending && tileId !== pending.tile) {
+            // Server "no path" signal: st:true for the CURRENT tile (no `s`
+            // field) when findPath fails. Fail fast instead of timing out.
+            this._pendingMove = null;
+            if (pending.resolve) pending.resolve({ tileId, userId, moved: false, reason: 'no_path' });
+          }
+        }
+        this._bufferEvent('w:move', { userId, tileId, arrived, stepMs });
         break;
       }
 
@@ -419,6 +669,35 @@ class BotConnection extends EventEmitter {
         break;
       }
 
+      case 'setAvatar:ok': {
+        const p = this._pendingAvatar;
+        if (p) {
+          this._pendingAvatar = null;
+          clearTimeout(p.timer);
+          // The server rebroadcasts w:rem + w:add with the new path; give it
+          // a beat to arrive so we can report the confirmed avatar.
+          setTimeout(() => {
+            const av = this.getOwnAvatar();
+            p.resolve({ ok: true, vrmUrl: p.vrmUrl, ms: Date.now() - p.sentAt,
+              confirmedPath: av?.path || null, confirmedCollection: av?.collection || null });
+          }, 800);
+        }
+        this._bufferEvent('setAvatar:ok', {});
+        break;
+      }
+
+      case 'setAvatar:failed': {
+        const reason = msg.a?.[0]?.reason || msg.a?.[0] || 'unknown';
+        const p = this._pendingAvatar;
+        if (p) {
+          this._pendingAvatar = null;
+          clearTimeout(p.timer);
+          p.resolve({ ok: false, vrmUrl: p.vrmUrl, reason: String(reason), ms: Date.now() - p.sentAt });
+        }
+        this._bufferEvent('setAvatar:failed', { reason: String(reason) });
+        break;
+      }
+
       case 'redirect':
         this._bufferEvent('redirect', { target: msg.a?.[0] });
         break;
@@ -435,6 +714,7 @@ class BotConnection extends EventEmitter {
           if (pos) user.position = pos;
           if (rot) user.rotation = rot;
           if (anim) user.animation = anim;
+          user.lastSeen = Date.now();
         }
         break;
       }
@@ -540,13 +820,84 @@ class BotConnection extends EventEmitter {
 
   // --- Actions ---
 
-  moveToTile(tileId) { this._send({ h: 'w:move', a: [tileId] }); }
+  // The bot's true current (x, z) from the server snapshot/broadcasts, or null
+  // if we haven't identified our own user entry yet.
+  getOwnPosition() {
+    if (!this.ownUserId) return null;
+    const me = this.knownUsers.get(String(this.ownUserId));
+    return me && me.position ? { x: me.position.x, z: me.position.z } : null;
+  }
+  // The bot's own avatar as the server sees it (from our w:add entry).
+  getOwnAvatar() {
+    if (!this.ownUserId) return null;
+    const me = this.knownUsers.get(String(this.ownUserId));
+    if (!me) return null;
+    return { path: me.avatarPath || null, collection: me.avatarCollection || null, thumb: me.avatarThumb || null };
+  }
+  moveToTile(tileId, boost = false) {
+    const target = Number(tileId);
+    // Light tracking so the arrival echo can correct ownTile/learn ownUserId
+    // even when the caller doesn't wait (see w:move handler).
+    if (this._pendingMove?.reject) { try { this._pendingMove.reject(new Error('superseded by a newer move')); } catch {} }
+    this._pendingMove = { tile: target, sentAt: Date.now(), resolve: null, reject: null };
+    // Server MoveMessage.handle(tile, boost): boost = 250ms steps (2x speed).
+    this._send({ h: 'w:move', a: boost ? [target, true] : [target] });
+    this.ownTile = target; // optimistic; corrected by step echoes
+  }
+  // Send a move and wait for the server's arrival echo (w:move broadcast with
+  // st:true for our own user id). The server pathfinds and streams step
+  // echoes; there is no other arrival signal. Resolves {tileId, userId, ms,
+  // moved:true} on arrival, or {moved:false} if no step echoes arrive within
+  // noEchoMs (bot already there, or the move was rejected). Rejects on timeout.
+  moveToTileAndWait(tileId, timeoutMs = 90000, noEchoMs = 5000, boost = false) {
+    return new Promise((resolve, reject) => {
+      const target = Number(tileId);
+      if (!Number.isFinite(target)) { reject(new Error('moveToTileAndWait: invalid tileId')); return; }
+      const sentAt = Date.now();
+      const timer = setTimeout(() => {
+        if (this._pendingMove?.tile === target) this._pendingMove = null;
+        reject(new Error(`move to tile ${target} timed out after ${timeoutMs}ms (no arrival echo)`));
+      }, timeoutMs);
+      const noEchoTimer = setTimeout(() => {
+        const p = this._pendingMove;
+        if (p && p.tile === target && !p.seenEcho) {
+          this._pendingMove = null;
+          clearTimeout(timer);
+          resolve({ tileId: target, userId: this.ownUserId, ms: Date.now() - sentAt, moved: false });
+        }
+      }, noEchoMs);
+      this.moveToTile(target, boost); // sets _pendingMove (light)
+      // Upgrade the pending entry to a waiter.
+      this._pendingMove.seenEcho = false;
+      this._pendingMove.resolve = (info) => {
+        clearTimeout(timer); clearTimeout(noEchoTimer);
+        resolve({ tileId: info.tileId, userId: info.userId, ms: Date.now() - sentAt, moved: info.moved !== false, reason: info.reason || null });
+      };
+      this._pendingMove.reject = (err) => { clearTimeout(timer); clearTimeout(noEchoTimer); reject(err); };
+    });
+  }
   sendChat(message) { return this._send({ h: 'chat', a: [message] }); }
   sendEmote(animation) { this._send({ h: 'emote', a: [animation, false] }); }
   sendRotation(x, y, z) { this._send({ h: 'w:rot', a: [{ x, y, z }] }); }
   sendLookAt(x, y, z) { this._send({ h: 'w:lookAt', a: [{ x, y, z }] }); }
   sendTypingStatus(isTyping) { this._send({ h: 'ts', a: [isTyping] }); }
   sendSetAvatar(asset) { this._send({ h: 'setAvatar', a: [asset] }); }
+  // Send setAvatar and wait for the server's verdict (setAvatar:ok or
+  // setAvatar:failed with a reason like not_optimized/gated/invalid_url).
+  // Resolves {ok, vrmUrl, ms[, reason]}; never rejects on server refusal.
+  setAvatarAndWait(vrmUrl, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      if (!vrmUrl || typeof vrmUrl !== 'string') { reject(new Error('vrmUrl is required')); return; }
+      if (this._pendingAvatar) { clearTimeout(this._pendingAvatar.timer); this._pendingAvatar.resolve({ ok: false, vrmUrl: this._pendingAvatar.vrmUrl, reason: 'superseded', ms: Date.now() - this._pendingAvatar.sentAt }); }
+      const sentAt = Date.now();
+      const timer = setTimeout(() => {
+        if (this._pendingAvatar?.vrmUrl === vrmUrl) this._pendingAvatar = null;
+        resolve({ ok: false, vrmUrl, reason: 'timeout', ms: Date.now() - sentAt });
+      }, timeoutMs);
+      this._pendingAvatar = { vrmUrl, sentAt, timer, resolve };
+      this.sendSetAvatar(vrmUrl);
+    });
+  }
 
   // --- Patrol ---
 
@@ -846,6 +1197,7 @@ const TOOLS = [
         wsUrl: { type: 'string', description: `WebSocket URL (default: ${DEFAULT_WS_URL})` },
         vrmUrl: { type: 'string', description: 'VRM avatar URL (optional)' },
         token: { type: 'string', description: 'hbz_ access token override (default: HUBZZ_BOT_TOKEN env)' },
+        serverUsername: { type: 'string', description: 'The token account\'s server-side username (e.g. "cado"). Lets the bot identify its own user entry for accurate self position.' },
         autoReconnect: { type: 'boolean', description: 'Enable auto-reconnect on disconnect (default: false)' },
       },
       required: ['name'],
@@ -853,12 +1205,13 @@ const TOOLS = [
   },
   {
     name: 'bot_move',
-    description: 'Move a bot to a specific tile in the world.',
+    description: 'Move a bot to a specific tile in the world. The server pathfinds and walks; step echoes correct the tracked position.',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: 'Bot name' },
         tileId: { type: 'number', description: 'Tile ID to move to' },
+        boost: { type: 'boolean', description: 'Double-speed walk (250ms steps instead of 500ms). Default false.' },
       },
       required: ['name', 'tileId'],
     },
@@ -992,16 +1345,60 @@ const TOOLS = [
   },
   {
     name: 'bot_set_avatar',
-    description: 'Change a bot\'s avatar via setAvatar protocol or !shuffle chat command.',
+    description: 'Change a bot\'s avatar via setAvatar protocol or !shuffle chat command. For vrm, waits for the server verdict (ok / failed with reason like not_optimized, gated).',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: 'Bot name' },
         method: { type: 'string', enum: ['vrm', 'shuffle'], description: 'vrm = set VRM URL, shuffle = random avatar' },
-        vrmUrl: { type: 'string', description: 'VRM URL (required if method is vrm)' },
+        vrmUrl: { type: 'string', description: 'VRM URL (required if method is vrm). Must be altii.co-hosted (worker URLs are canonicalized); .mml must be hubzz.app.' },
         collection: { type: 'string', description: 'Collection slug for shuffle (optional)' },
+        timeoutMs: { type: 'number', description: 'Wait for server verdict this long (default 15000)' },
       },
       required: ['name', 'method'],
+    },
+  },
+  {
+    name: 'bot_test_avatars',
+    description: 'Batch-test avatar VRM URLs for issues. Cycles a bot through each URL, waits for the server verdict per avatar, and reports ok/failed with the failure reason (not_optimized, gated, invalid_url, timeout). Use to find broken avatars.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        vrmUrls: { type: 'array', items: { type: 'string' }, description: 'VRM URLs to test, in order' },
+        timeoutMs: { type: 'number', description: 'Wait per avatar for the server verdict (default 15000)' },
+        pauseMs: { type: 'number', description: 'Pause between avatars in ms (default 1000)' },
+      },
+      required: ['name', 'vrmUrls'],
+    },
+  },
+  {
+    name: 'bot_avatar_info',
+    description: 'Get avatar metadata (height_m, triangles, file sizes, thumbnail, collection, license) from the avatars-api for a VRM URL, or for a bot\'s current avatar. Uses sonar-tracked w:add data when no URL is given.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name (used for current-avatar lookup when vrmUrl is omitted)' },
+        vrmUrl: { type: 'string', description: 'VRM URL to look up (defaults to the bot\'s current avatar)' },
+        apiBase: { type: 'string', description: 'Avatars API base (default https://avatars.hubzz.app/avatar-api)' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'bot_test_all_avatars',
+    description: 'Test EVERY avatar in the avatars-api for issues. Pages the full avatar catalog, HEAD-checks each VRM URL for reachability, and optionally spot-checks a sample through the bot\'s setAvatar for server acceptance. Returns counts plus the list of broken avatars.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name (only required when spotCheck > 0)' },
+        limit: { type: 'number', description: 'Max avatars to test (default: all)' },
+        offset: { type: 'number', description: 'Start at this catalog offset (default 0)' },
+        concurrency: { type: 'number', description: 'Parallel HEAD checks (default 20, max 50)' },
+        spotCheck: { type: 'number', description: 'Also run this many avatars through the bot setAvatar for server acceptance (default 0 = reachability only)' },
+        apiBase: { type: 'string', description: 'Avatars API base (default https://avatars.hubzz.app/avatar-api)' },
+      },
+      required: [],
     },
   },
   {
@@ -1443,6 +1840,98 @@ const TOOLS = [
       properties: {},
     },
   },
+  // === Cherry-picked from archived russfranky/hubzz-alpha (packages/bot-mcp) ===
+  {
+    name: 'bot_send_raw',
+    description: 'Send a raw WebSocket message using the Hubzz protocol { h, a } format. For debugging and protocol probing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        h: { type: 'string', description: 'Message handler name' },
+        a: { type: 'array', description: 'Args array', items: {} },
+      },
+      required: ['name', 'h'],
+    },
+  },
+  {
+    name: 'server_health',
+    description: 'Fetch /api/health from the Hubzz server. Returns status, uptime, connections, worlds, memory.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        apiUrl: { type: 'string', description: 'API base URL (default: https://hubzz.app)' },
+      },
+    },
+  },
+  {
+    name: 'server_spaces',
+    description: 'List spaces/worlds from the Hubzz server via /api/spaces.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        apiUrl: { type: 'string', description: 'API base URL (default: https://hubzz.app)' },
+      },
+    },
+  },
+  {
+    name: 'server_space_info',
+    description: 'Get info about one space/world via /api/space/{path}.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        apiUrl: { type: 'string', description: 'API base URL (default: https://hubzz.app)' },
+        path: { type: 'string', description: 'Space path, e.g. 0,0' },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'server_emotes',
+    description: 'List available emotes/animations from the Hubzz server via /api/emotes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        apiUrl: { type: 'string', description: 'API base URL (default: https://hubzz.app)' },
+      },
+    },
+  },
+  // === Perception & navigation: the bot's eyes and feet ===
+  {
+    name: 'bot_sonar',
+    description: 'Perception sweep for a bot: self position, nearby users with distance/direction, nearby entities, open walkable tiles, open seats (real chair objects), recent chat, an ASCII top-down map, and a plain-language scene summary. This is the bot\'s eyes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        radius: { type: 'number', description: 'Perception radius in world units (default: 15, max: 60)' },
+        includeAscii: { type: 'boolean', description: 'Include the ASCII top-down map (default: true)' },
+        maximumUsers: { type: 'number', description: 'Max nearby users to report (default: 20)' },
+        selfUsername: { type: 'string', description: 'Server-side account name of the bot itself (e.g. cado) — excluded from nearby users' },
+        mapUrl: { type: 'string', description: 'Map JSON URL (default: https://hubzz.xyz/data/maps/world_2.json)' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'bot_navigate',
+    description: 'Walk a bot to a tile, a named user, or world coordinates. Sends one move; the server pathfinds and streams per-step echoes ending with an arrival signal (st:true), which this tool waits for — fully closed-loop, no time estimates.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Bot name' },
+        tileId: { type: 'number', description: 'Destination tile id (one of tileId, username, or x+z)' },
+        username: { type: 'string', description: 'Walk toward this user (resolved to nearest walkable tile at call time)' },
+        x: { type: 'number', description: 'Destination world x (with z)' },
+        z: { type: 'number', description: 'Destination world z (with x)' },
+        arriveRadius: { type: 'number', description: 'Considered arrived within this many units of the goal (default: 3)' },
+        timeoutMs: { type: 'number', description: 'Give up waiting for the arrival echo after this long (default: 90000, max 300000)' },
+        boost: { type: 'boolean', description: 'Double-speed walk (250ms steps). Default false.' },
+        mapUrl: { type: 'string', description: 'Map JSON URL (default: https://hubzz.app/data/maps/world_2.json)' },
+      },
+      required: ['name'],
+    },
+  },
 ];
 
 // --- Tool Handlers ---
@@ -1460,11 +1949,14 @@ async function handleTool(name, args) {
       if (wsCheck.error) return wsCheck;
       const wsUrl = wsCheck.wsUrl;
       const bot = new BotConnection(wsUrl, botName, args.vrmUrl || '', { autoReconnect: args.autoReconnect || false, token: args.token });
+      if (typeof args.serverUsername === 'string' && args.serverUsername.trim() !== '') {
+        bot.serverUsernameHint = args.serverUsername.trim();
+      }
       try {
         await bot.connect();
         bots.set(botName, bot);
         await sleep(1000);
-        return { status: 'connected', name: botName, wsUrl, usersInWorld: bot.knownUsers.size };
+        return { status: 'connected', name: botName, wsUrl, usersInWorld: bot.knownUsers.size, ownUserId: bot.ownUserId };
       } catch (err) {
         bot.close();
         return { error: `Failed to spawn bot: ${err.message}` };
@@ -1475,9 +1967,9 @@ async function handleTool(name, args) {
       const r = getBot(args.name); if (r.error) return r;
       const tileId = Number(args.tileId);
       if (!Number.isFinite(tileId)) return { error: `Invalid tileId: ${args.tileId}` };
-      r.moveToTile(tileId);
+      r.moveToTile(tileId, args.boost === true);
       r.ownTile = tileId;
-      return { status: 'moved', name: args.name, tileId };
+      return { status: 'moved', name: args.name, tileId, boost: args.boost === true };
     }
 
     case 'bot_chat': {
@@ -1725,8 +2217,188 @@ async function handleTool(name, args) {
         return { status: 'shuffle_sent', name: args.name, collection: args.collection || 'default' };
       }
       if (!args.vrmUrl) return { error: 'vrmUrl is required when method is vrm' };
-      r.sendSetAvatar(args.vrmUrl);
-      return { status: 'avatar_set', name: args.name, vrmUrl: args.vrmUrl };
+      // Wait for the server's verdict so avatar issues surface immediately.
+      const res = await r.setAvatarAndWait(args.vrmUrl, args.timeoutMs || 15000);
+      return { status: res.ok ? 'avatar_set' : 'avatar_failed', name: args.name, ...res };
+    }
+
+    case 'bot_test_avatars': {
+      const r = getBot(args.name); if (r.error) return r;
+      const urls = Array.isArray(args.vrmUrls) ? args.vrmUrls.filter(u => typeof u === 'string' && u) : [];
+      if (urls.length === 0) return { error: 'vrmUrls must be a non-empty array of strings' };
+      if (urls.length > 50) return { error: 'vrmUrls capped at 50 per run' };
+      const perAvatarMs = args.timeoutMs || 15000;
+      const pauseMs = args.pauseMs != null ? Math.max(0, Number(args.pauseMs)) : 1000;
+      const results = [];
+      for (const url of urls) {
+        // The server only validates host/format, NOT file existence — so
+        // check reachability too. A 200 with a VRM content-type/length is
+        // the real "this avatar loads" signal.
+        let reachable = null, httpStatus = null, contentLength = null;
+        try {
+          const u = new URL(url);
+          const mod = u.protocol === 'https:' ? https : null;
+          if (mod) {
+            const info = await new Promise((resolve) => {
+              const req = mod.request(url, { method: 'HEAD', timeout: 10000 }, (res) => {
+                resolve({ status: res.statusCode, len: res.headers['content-length'] || null });
+              });
+              req.on('error', () => resolve(null));
+              req.on('timeout', () => { req.destroy(); resolve(null); });
+              req.end();
+            });
+            if (info) { reachable = info.status >= 200 && info.status < 400; httpStatus = info.status; contentLength = info.len; }
+          }
+        } catch {}
+        const res = await r.setAvatarAndWait(url, perAvatarMs);
+        results.push({ vrmUrl: url, ok: res.ok, reason: res.reason || null, ms: res.ms, reachable, httpStatus, contentLength });
+        if (pauseMs > 0) await sleep(pauseMs);
+      }
+      const okCount = results.filter(x => x.ok).length;
+      return {
+        status: 'avatars_tested', name: args.name,
+        total: results.length, ok: okCount, failed: results.length - okCount,
+        results,
+      };
+    }
+
+    case 'bot_avatar_info': {
+      const apiBase = args.apiBase || 'https://avatars.hubzz.app/avatar-api';
+      let vrmUrl = args.vrmUrl || null;
+      let botAvatar = null;
+      if (!vrmUrl) {
+        if (!args.name) return { error: 'provide vrmUrl or a bot name' };
+        const gr = getBot(args.name); if (gr.error) return gr;
+        botAvatar = gr.getOwnAvatar();
+        vrmUrl = botAvatar?.path || null;
+        if (!vrmUrl) return { error: 'bot has no known avatar path yet (w:add not seen)' };
+      }
+      // Normalize for comparison (server canonicalizes worker URLs to altii.co).
+      const norm = (u) => String(u || '').replace('https://hubzz-assets-worker.hubzzhq.workers.dev/files/', 'https://altii.co/');
+      const target = norm(vrmUrl);
+      // Paginated URL-match against the catalog (cap 10k).
+      let found = null, offset = 0;
+      while (offset < 10000 && !found) {
+        let page;
+        try {
+          const res = await fetch(`${apiBase}/avatars?limit=500&offset=${offset}`);
+          if (!res.ok) break;
+          page = await res.json();
+        } catch { break; }
+        for (const a of (page.avatars || [])) {
+          if (norm(a.optimized_vrm_url) === target || norm(a.original_vrm_url) === target) { found = a; break; }
+        }
+        offset += 500;
+        if (!page.has_more) break;
+      }
+      const result = { vrmUrl, foundInCatalog: !!found };
+      if (botAvatar) result.botAvatar = botAvatar;
+      if (found) {
+        result.name = found.name;
+        result.collection = found.collection_slug || found.set_slug;
+        result.height_m = found.height_m;
+        result.triangles = found.triangles;
+        result.fileSizeOptimized = found.file_size_optimized;
+        result.fileSizeOriginal = found.file_size_original;
+        result.thumbnail = found.thumbnail_url;
+        result.image = found.image_url;
+        result.license = found.license;
+        result.bakedScale = found.baked_scale;
+        result.sizingDecision = found.sizing_decision;
+        result.contentRating = found.contentRating;
+      } else {
+        result.note = 'URL not in the published catalog (custom/unlisted avatar). Server accepts any altii.co URL; reachability is the real check.';
+      }
+      return result;
+    }
+
+    case 'bot_test_all_avatars': {
+      // The reachability sweep is pure HTTP and does not need a live bot —
+      // only the optional spotCheck goes through setAvatar. So the bot is
+      // only required when spotCheck > 0.
+      const spotCheckN = Math.min(50, Math.max(0, args.spotCheck || 0));
+      let r = null;
+      if (spotCheckN > 0) {
+        const gr = getBot(args.name); if (gr.error) return gr;
+        r = gr;
+      }
+      const apiBase = args.apiBase || 'https://avatars.hubzz.app/avatar-api';
+      const concurrency = Math.min(50, Math.max(1, args.concurrency || 20));
+      const startOffset = Math.max(0, args.offset || 0);
+      const maxAvatars = args.limit != null ? Math.max(1, args.limit) : Infinity;
+
+      // 1. Page the full catalog.
+      const catalog = [];
+      let offset = startOffset, total = Infinity;
+      while (offset < total && catalog.length < maxAvatars) {
+        const pageSize = Math.min(500, maxAvatars - catalog.length);
+        let page;
+        try {
+          const res = await fetch(`${apiBase}/avatars?limit=${pageSize}&offset=${offset}`);
+          if (!res.ok) return { error: `avatar-api returned HTTP ${res.status}` };
+          page = await res.json();
+        } catch (e) {
+          return { error: `avatar-api fetch failed: ${e.message}` };
+        }
+        total = page.total ?? 0;
+        for (const a of (page.avatars || [])) {
+          const url = a.optimized_vrm_url || a.original_vrm_url || '';
+          if (url) catalog.push({ id: a.id, name: a.name, url, collection: a.collection_slug || a.set_slug || '' });
+        }
+        offset += pageSize;
+        if (!page.has_more) break;
+      }
+
+      // 2. HEAD-check every VRM URL with bounded concurrency.
+      async function headCheck(url) {
+        try {
+          const u = new URL(url);
+          if (u.protocol !== 'https:' && u.protocol !== 'http:') return { reachable: false, httpStatus: null, error: 'bad_protocol' };
+          const mod = u.protocol === 'https:' ? https : http;
+          return await new Promise((resolve) => {
+            const req = mod.request(url, { method: 'HEAD', timeout: 15000 }, (res) => {
+              resolve({ reachable: res.statusCode >= 200 && res.statusCode < 400, httpStatus: res.statusCode, contentLength: res.headers['content-length'] || null });
+            });
+            req.on('error', (e) => resolve({ reachable: false, httpStatus: null, error: e.message }));
+            req.on('timeout', () => { req.destroy(); resolve({ reachable: false, httpStatus: null, error: 'timeout' }); });
+            req.end();
+          });
+        } catch (e) {
+          return { reachable: false, httpStatus: null, error: e.message };
+        }
+      }
+      const results = new Array(catalog.length);
+      let nextIdx = 0;
+      async function worker() {
+        while (nextIdx < catalog.length) {
+          const i = nextIdx++;
+          const c = catalog[i];
+          const h = await headCheck(c.url);
+          results[i] = { ...c, ...h };
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(concurrency, catalog.length) }, worker));
+
+      // 3. Optional: spot-check server acceptance through the bot.
+      const spotResults = [];
+      for (let i = 0; i < Math.min(spotCheckN, results.length); i++) {
+        const sv = await r.setAvatarAndWait(results[i].url, 15000);
+        spotResults.push({ url: results[i].url, serverOk: sv.ok, reason: sv.reason || null });
+        await sleep(500);
+      }
+
+      const broken = results.filter(x => !x.reachable);
+      return {
+        status: 'all_avatars_tested',
+        bot: r ? args.name : null,
+        catalogTotal: total,
+        tested: results.length,
+        reachable: results.length - broken.length,
+        broken: broken.length,
+        brokenAvatars: broken.slice(0, 200).map(b => ({ id: b.id, name: b.name, url: b.url, collection: b.collection, httpStatus: b.httpStatus, error: b.error || null })),
+        brokenTruncated: broken.length > 200,
+        spotCheck: spotResults.length > 0 ? spotResults : undefined,
+      };
     }
 
     case 'bot_nick': {
@@ -2791,6 +3463,381 @@ async function handleTool(name, args) {
       return { status: 'stopped' };
     }
 
+    // === Cherry-picked from archived russfranky/hubzz-alpha (packages/bot-mcp) ===
+
+    case 'bot_send_raw': {
+      const r = getBot(args.name); if (r.error) return r;
+      const h = args.h;
+      if (typeof h !== 'string' || h.trim() === '') return { error: 'h (message handler name) is required' };
+      const a = args.a === undefined ? [] : args.a;
+      if (!Array.isArray(a)) return { error: 'a must be an array' };
+      r._send({ h, a });
+      return { status: 'sent', name: args.name, h, a };
+    }
+
+    case 'server_health': {
+      const url = (args.apiUrl || DEFAULT_API_URL) + '/api/health';
+      try {
+        const { status, body } = await httpGetJson(url);
+        return { httpStatus: status, ...(body && typeof body === 'object' ? body : { body }) };
+      } catch (err) { return { error: err.message, url }; }
+    }
+
+    case 'server_spaces': {
+      const url = (args.apiUrl || DEFAULT_API_URL) + '/api/spaces';
+      try {
+        const { status, body } = await httpGetJson(url);
+        return { httpStatus: status, ...(body && typeof body === 'object' ? body : { body }) };
+      } catch (err) { return { error: err.message, url }; }
+    }
+
+    case 'server_space_info': {
+      if (args.path == null || String(args.path).trim() === '') return { error: 'path is required' };
+      // Do NOT encodeURIComponent the path: the server's /api/space/* wildcard
+      // splits on "/" and matches coordinates like "1,0" literally — an
+      // encoded comma (%2C) 404s.
+      const url = (args.apiUrl || DEFAULT_API_URL) + `/api/space/${String(args.path).trim()}`;
+      try {
+        const { status, body } = await httpGetJson(url);
+        return { httpStatus: status, ...(body && typeof body === 'object' ? body : { body }) };
+      } catch (err) { return { error: err.message, url }; }
+    }
+
+    case 'server_emotes': {
+      const url = (args.apiUrl || DEFAULT_API_URL) + '/api/emotes';
+      try {
+        const { status, body } = await httpGetJson(url);
+        const emotes = body?.emotes;
+        return { httpStatus: status, count: Array.isArray(emotes) ? emotes.length : undefined, emotes: Array.isArray(emotes) ? emotes.slice(0, 50) : body };
+      } catch (err) { return { error: err.message, url }; }
+    }
+
+    // === bot_sonar: the bot's eyes ===
+    case 'bot_sonar': {
+      const r = getBot(args.name); if (r.error) return r;
+      const radius = Math.min(Math.max(Number(args.radius ?? 15) || 15, 1), 60);
+      const includeAscii = args.includeAscii !== false;
+      const maximumUsers = Math.min(Math.max(Number(args.maximumUsers ?? 20) || 20, 1), 100);
+      const selfUsername = typeof args.selfUsername === 'string' && args.selfUsername.trim() !== ''
+        ? args.selfUsername.trim() : null;
+      const mapUrl = args.mapUrl || 'https://hubzz.xyz/data/maps/world_2.json';
+
+      let map;
+      try { map = await getCachedMap(mapUrl); }
+      catch (e) { return { error: `Failed to load map: ${e.message}` }; }
+
+      // Self position: prefer the true server-known position (via ownUserId),
+      // fall back to the echo-corrected/optimistic ownTile.
+      const ownPos = r.getOwnPosition();
+      const selfTile = r.ownTile != null ? map.byId.get(Number(r.ownTile)) : null;
+      const selfXZ = ownPos || (selfTile ? { x: selfTile.x, z: selfTile.z } : null);
+      const selfEntry = selfUsername
+        ? [...r.knownUsers.values()].find(u => u.username === selfUsername) : null;
+      const ownAv = r.getOwnAvatar();
+      const self = {
+        username: r.username,
+        serverUsername: selfEntry ? selfEntry.username : (selfUsername || null),
+        connected: r.connected,
+        tile: r.ownTile,
+        position: selfXZ ? { x: Math.round(selfXZ.x * 100) / 100, z: Math.round(selfXZ.z * 100) / 100 } : null,
+        positionSource: ownPos ? 'server' : (selfTile ? 'ownTile' : null),
+        avatar: ownAv?.path ? { path: ownAv.path, collection: ownAv.collection } : null,
+      };
+
+      const note = selfXZ ? null
+        : 'Bot has no known position yet. Move the bot once with bot_move so it can place itself on the map; distances and the ASCII map need a self position.';
+
+      const usersWithPos = [...r.knownUsers.values()].filter(u => u.position && Number.isFinite(u.position.x) && Number.isFinite(u.position.z));
+      const entitiesWithPos = [...r.entities.values()].filter(e => e.position && Number.isFinite(e.position.x) && Number.isFinite(e.position.z));
+
+      const describeActor = (u, isSelf) => {
+        const dx = u.position.x - self.position.x;
+        const dz = u.position.z - self.position.z;
+        const d = dist2(u.position.x, u.position.z, self.position.x, self.position.z);
+        // Confidence decay (npc-engine convention): observations are fresh for
+        // 30s, then stale. lastSeen is refreshed on w:add, w:move, and kbs.
+        const agoSec = u.lastSeen ? Math.round((Date.now() - u.lastSeen) / 100) / 10 : null;
+        return {
+          username: u.username, userId: String(u.id),
+          distance: Math.round(d * 10) / 10,
+          direction: compassFromDelta(dx, dz),
+          bearingDeg: Math.round(bearingFromDelta(dx, dz)),
+          facing: facingFromRotation(u.rotation),
+          tile: u.tile ?? null,
+          position: { x: Math.round(u.position.x * 100) / 100, z: Math.round(u.position.z * 100) / 100 },
+          animation: u.animation ?? null,
+          avatar: u.avatarPath ? { path: u.avatarPath, collection: u.avatarCollection || null } : null,
+          isBot: u.isBot === true,
+          afk: u.afkState || null,
+          lastSeenAgoSec: agoSec,
+          stale: agoSec != null && agoSec > 30,
+        };
+      };
+
+      let nearby = [];
+      let entities = [];
+      let openTiles = [];
+      let openSeats = [];
+      let ascii = null;
+      let legend = null;
+
+      if (selfXZ) {
+        // The protocol never tells the bot its own server-side user id, so the
+        // caller names it explicitly (e.g. the token account). Without it, the
+        // bot's own entry stays in the list, flagged.
+        nearby = usersWithPos
+          .map(u => {
+            const d = describeActor(u);
+            d.isSelf = selfUsername ? u.username === selfUsername : null;
+            return d;
+          })
+          .filter(u => u.isSelf !== true && u.distance <= radius)
+          .sort((a, b) => a.distance - b.distance)
+          .slice(0, maximumUsers);
+
+        entities = entitiesWithPos
+          .map(e => {
+            const dx = e.position.x - self.position.x, dz = e.position.z - self.position.z;
+            const d = dist2(e.position.x, e.position.z, self.position.x, self.position.z);
+            return {
+              type: e.type, id: String(e.id),
+              distance: Math.round(d * 10) / 10,
+              direction: compassFromDelta(dx, dz),
+              position: { x: Math.round(e.position.x * 100) / 100, z: Math.round(e.position.z * 100) / 100 },
+            };
+          })
+          .filter(e => e.distance <= radius)
+          .sort((a, b) => a.distance - b.distance)
+          .slice(0, 20);
+
+        const occupied = (x, z) =>
+          (selfXZ && dist2(selfXZ.x, selfXZ.z, x, z) < 1.5) ||
+          usersWithPos.some(u => dist2(u.position.x, u.position.z, x, z) < 1.5);
+        openTiles = map.walkable
+          .filter(t => dist2(t.x, t.z, self.position.x, self.position.z) <= radius && !occupied(t.x, t.z))
+          .map(t => {
+            const dx = t.x - self.position.x, dz = t.z - self.position.z;
+            return {
+              tile: Number(t.id), x: t.x, z: t.z,
+              distance: Math.round(dist2(t.x, t.z, self.position.x, self.position.z) * 10) / 10,
+              direction: compassFromDelta(dx, dz),
+            };
+          })
+          .sort((a, b) => a.distance - b.distance)
+          .slice(0, 12);
+
+        // Real seats: chair objects from the map whose tile is not occupied.
+        openSeats = (map.seats || [])
+          .map(s => {
+            const t = map.byId.get(Number(s.tile));
+            if (!t) return null;
+            const dx = t.x - self.position.x, dz = t.z - self.position.z;
+            return {
+              name: s.name, type: s.type, tile: Number(s.tile), x: t.x, z: t.z,
+              distance: Math.round(dist2(t.x, t.z, self.position.x, self.position.z) * 10) / 10,
+              direction: compassFromDelta(dx, dz),
+            };
+          })
+          .filter(s => s && s.distance <= radius && !occupied(s.x, s.z))
+          .sort((a, b) => a.distance - b.distance)
+          .slice(0, 12);
+
+        if (includeAscii) {
+          // Top-down map, 1 char per 2x2-unit cell (the tile spacing), centered on self.
+          const half = Math.min(Math.ceil(radius / 2), 20);
+          const cellOf = new Map();
+          for (const t of map.tiles) {
+            const gx = Math.round(t.x / 2), gz = Math.round(t.z / 2);
+            cellOf.set(`${gx},${gz}`, t.walkable ? '.' : '#');
+          }
+          const cgx = Math.round(self.position.x / 2), cgz = Math.round(self.position.z / 2);
+          const grid = [];
+          for (let gz = cgz - half; gz <= cgz + half; gz++) {
+            let row = '';
+            for (let gx = cgx - half; gx <= cgx + half; gx++) {
+              row += cellOf.get(`${gx},${gz}`) || ' ';
+            }
+            grid.push(row);
+          }
+          const plot = (x, z, ch) => {
+            const gx = Math.round(x / 2) - (cgx - half);
+            const gz = Math.round(z / 2) - (cgz - half);
+            if (gz >= 0 && gz < grid.length && gx >= 0 && gx < grid[gz].length) {
+              grid[gz] = grid[gz].slice(0, gx) + ch + grid[gz].slice(gx + 1);
+            }
+          };
+          const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+          legend = { '@': `you (${r.username})` };
+          nearby.forEach((u, i) => {
+            const ch = letters[i % letters.length];
+            plot(u.position.x, u.position.z, ch);
+            legend[ch] = `${u.username} (${u.distance}u ${u.direction})`;
+            u.marker = ch;
+          });
+          entities.forEach(e => plot(e.position.x, e.position.z, '*'));
+          legend['*'] = 'entity';
+          plot(self.position.x, self.position.z, '@');
+          ascii = grid.join('\n');
+        }
+      }
+
+      const recentChat = r.chatBuffer.slice(-10).map(m => ({
+        username: m.username, message: m.message,
+        agoSec: Math.round((Date.now() - m.timestamp) / 1000),
+      }));
+
+      // Plain-language scene summary.
+      let summary;
+      if (!selfXZ) {
+        summary = `${r.username} is connected but has no known position yet. Move it once with bot_move so sonar can place it on the map.`;
+      } else {
+        const atTile = self.tile != null ? `tile ${self.tile} ` : '';
+        const parts = [`${r.username} is at ${atTile}(${self.position.x}, ${self.position.z}).`];
+        if (nearby.length === 0) parts.push(`No other users within ${radius} units.`);
+        else {
+          const names = nearby.slice(0, 5).map(u => `${u.username} ${u.distance}u ${u.direction}`).join(', ');
+          parts.push(`${nearby.length} user${nearby.length === 1 ? '' : 's'} nearby: ${names}${nearby.length > 5 ? ', …' : ''}.`);
+        }
+        if (entities.length > 0) parts.push(`${entities.length} entit${entities.length === 1 ? 'y' : 'ies'} in range (${entities.slice(0, 3).map(e => e.type).join(', ')}).`);
+        if (openTiles.length > 0) parts.push(`Nearest open tile: ${openTiles[0].tile} (${openTiles[0].distance}u ${openTiles[0].direction}).`);
+        if (openSeats.length > 0) parts.push(`Nearest open seat: ${openSeats[0].name} (tile ${openSeats[0].tile}, ${openSeats[0].distance}u ${openSeats[0].direction}).`);
+        if (recentChat.length > 0) {
+          const last = recentChat[recentChat.length - 1];
+          parts.push(`Last chat ${last.agoSec}s ago from ${last.username}: "${String(last.message).slice(0, 80)}".`);
+        }
+        summary = parts.join(' ');
+      }
+
+      return { self, nearby, entities, openTiles, openSeats, recentChat, ascii, legend, summary, note };
+    }
+
+    // === bot_navigate: closed-loop server-pathfind walk ===
+    case 'bot_navigate': {
+      // Closed-loop navigation. The server pathfinds from a single w:move and
+      // streams per-step w:move echoes back, ending with st:true (arrival).
+      // We send ONE move and wait for that arrival echo — no time estimates.
+      const r = getBot(args.name); if (r.error) return r;
+      const mapUrl = args.mapUrl || 'https://hubzz.xyz/data/maps/world_2.json';
+      const arriveRadius = Number(args.arriveRadius ?? 3);
+      const timeoutMs = Math.min(Math.max(Number(args.timeoutMs ?? 90000) || 90000, 5000), 300000);
+      if (!Number.isFinite(arriveRadius) || arriveRadius < 0) return { error: 'arriveRadius must be a non-negative number' };
+
+      let map;
+      try { map = await getCachedMap(mapUrl); }
+      catch (e) { return { error: `Failed to load map: ${e.message}` }; }
+
+      const hasTileId = args.tileId != null;
+      const hasUser = typeof args.username === 'string' && args.username.trim() !== '';
+      const hasXZ = args.x != null && args.z != null;
+      if ([hasTileId, hasUser, hasXZ].filter(Boolean).length !== 1) {
+        return { error: 'Provide exactly one destination: tileId, username, or x+z' };
+      }
+
+      let targetTile, targetLabel;
+      // Tiles occupied by other users reject moves (server sends no echoes),
+      // so destination resolution avoids them.
+      const occupiedByOther = (x, z) => [...r.knownUsers.values()].some(u => {
+        if (r.ownUserId && String(u.id) === String(r.ownUserId)) return false;
+        return u.position && dist2(u.position.x, u.position.z, x, z) < 2.25;
+      });
+      const nearestFree = (x, z) => {
+        let best = null, bd = Infinity;
+        for (const t of map.walkable) {
+          if (occupiedByOther(t.x, t.z)) continue;
+          const d = dist2(t.x, t.z, x, z);
+          if (d < bd) { bd = d; best = t; }
+        }
+        return best;
+      };
+      if (hasTileId) {
+        const t = map.byId.get(Number(args.tileId));
+        if (!t) return { error: `Tile ${args.tileId} not found in map` };
+        if (!t.walkable) {
+          const near = nearestFree(t.x, t.z);
+          if (!near) return { error: `Tile ${args.tileId} is not walkable and no free walkable tile is nearby` };
+          targetTile = near; targetLabel = `tile ${args.tileId} (blocked; retargeted to walkable ${near.id})`;
+        } else if (occupiedByOther(t.x, t.z)) {
+          const near = nearestFree(t.x, t.z);
+          if (!near) return { error: `Tile ${args.tileId} is occupied by another user and no free tile is nearby` };
+          targetTile = near; targetLabel = `tile ${args.tileId} (occupied; retargeted to ${near.id})`;
+        } else { targetTile = t; targetLabel = `tile ${args.tileId}`; }
+      } else if (hasUser) {
+        const u = [...r.knownUsers.values()].find(u => u.username === args.username || String(u.id) === String(args.username));
+        if (!u || !u.position) return { error: `User "${args.username}" not visible` };
+        const t = nearestFree(u.position.x, u.position.z);
+        if (!t) return { error: 'No free walkable tile near user' };
+        targetTile = t; targetLabel = `user ${args.username} (walkable tile ${t.id})`;
+      } else {
+        const t = nearestFree(Number(args.x), Number(args.z));
+        if (!t) return { error: 'No free walkable tile near x,z' };
+        targetTile = t; targetLabel = `position (${args.x}, ${args.z}) (walkable tile ${t.id})`;
+      }
+
+      const t0 = Date.now();
+      // Already there? Prefer the server-known own position (via serverUsername
+      // hint); fall back to the echo-corrected ownTile.
+      const ownPos = r.getOwnPosition();
+      const alreadyThere = (() => {
+        if (ownPos) return dist2(ownPos.x, ownPos.z, targetTile.x, targetTile.z) <= arriveRadius;
+        if (r.ownTile != null) {
+          const cur = map.byId.get(Number(r.ownTile));
+          if (cur) return dist2(cur.x, cur.z, targetTile.x, targetTile.z) <= arriveRadius;
+        }
+        return false;
+      })();
+      if (alreadyThere) {
+        const d0 = ownPos
+          ? dist2(ownPos.x, ownPos.z, targetTile.x, targetTile.z)
+          : dist2(map.byId.get(Number(r.ownTile)).x, map.byId.get(Number(r.ownTile)).z, targetTile.x, targetTile.z);
+        return {
+          reached: true, reason: 'already_there', target: targetLabel,
+          seconds: 0, finalTile: r.ownTile == null ? null : Number(r.ownTile), goalTile: Number(targetTile.id),
+          finalDistance: Math.round(d0 * 10) / 10,
+        };
+      }
+      // One move; the server walks the path and echoes arrival (st:true).
+      let arrival;
+      try {
+        arrival = await r.moveToTileAndWait(Number(targetTile.id), timeoutMs, 5000, args.boost === true);
+      } catch (e) {
+        const cur = r.ownTile != null ? map.byId.get(Number(r.ownTile)) : null;
+        const d = cur ? dist2(cur.x, cur.z, targetTile.x, targetTile.z) : null;
+        return {
+          reached: false, reason: 'timeout', target: targetLabel,
+          seconds: Math.round((Date.now() - t0) / 100) / 10,
+          finalTile: r.ownTile == null ? null : Number(r.ownTile), goalTile: Number(targetTile.id),
+          finalDistance: d == null ? null : Math.round(d * 10) / 10,
+          detail: e.message,
+        };
+      }
+      if (!arrival.moved) {
+        // Server sent no step echoes (already there / rejected) or the
+        // explicit no-path signal (st:true for the current tile).
+        const d = ownPos ? dist2(ownPos.x, ownPos.z, targetTile.x, targetTile.z) : null;
+        const already = d != null && d <= arriveRadius;
+        return {
+          reached: already,
+          reason: already ? 'already_there' : (arrival.reason === 'no_path' ? 'no_path' : 'no_movement'),
+          target: targetLabel,
+          seconds: Math.round(arrival.ms / 100) / 10,
+          finalTile: r.ownTile == null ? null : Number(r.ownTile), goalTile: Number(targetTile.id),
+          finalDistance: d == null ? null : Math.round(d * 10) / 10,
+          detail: arrival.reason === 'no_path'
+            ? 'server could not pathfind to the target (st:true for current tile)'
+            : 'no step echoes from server within 5s of the move',
+        };
+      }
+      const final = map.byId.get(Number(arrival.tileId));
+      const d = final ? dist2(final.x, final.z, targetTile.x, targetTile.z) : null;
+      return {
+        reached: d == null ? true : d <= arriveRadius,
+        reason: 'arrived', target: targetLabel,
+        seconds: Math.round(arrival.ms / 100) / 10,
+        finalTile: Number(arrival.tileId), goalTile: Number(targetTile.id),
+        finalDistance: d == null ? null : Math.round(d * 10) / 10,
+      };
+    }
+
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -2840,9 +3887,12 @@ async function handleRequest(request) {
 }
 
 // --- stdio Message Parser (newline-delimited JSON) ---
+// Only start the MCP server loop when run directly (node bot-mcp.mjs), not
+// when imported for unit tests.
 
 let buffer = '';
 
+if (isMainModule) {
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => {
   buffer += chunk;
@@ -2865,6 +3915,7 @@ process.stdin.on('data', (chunk) => {
     }
   }
 });
+} // end isMainModule
 
 // Cleanup on exit
 process.on('SIGINT', () => {
@@ -2878,4 +3929,4 @@ process.on('SIGTERM', () => {
 });
 
 // Keep alive
-process.stdin.resume();
+if (isMainModule) process.stdin.resume();
