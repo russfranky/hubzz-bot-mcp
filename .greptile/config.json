@@ -1,0 +1,37 @@
+{
+  "strictness": 2,
+  "commentTypes": ["logic", "syntax"],
+  "effort": "auto",
+  "autoReview": ["open", "push"],
+  "statusCheck": true,
+  "fixWithAI": true,
+  "ignorePatterns": "package-lock.json\n**/node_modules/**",
+  "context": { "repos": ["russfranky/drift"] },
+  "instructions": "hubzz-bot-mcp is the MCP server that spawns and drives bots in Hubzz worlds over the game WebSocket. Protocol contracts are recorded in russfranky/drift notes/hubzz-contracts/bot-mcp.md (read via context.repos). Org rules hubzz-r1..r4 also apply.",
+  "rules": [
+    {
+      "id": "botmcp-frame-delimiter",
+      "rule": "Game frames are delimited by U+F8FF (DELIMITER). Do not replace the delimiter or parse a raw WebSocket payload as a single JSON message. Source: russfranky/drift notes/hubzz-contracts/bot-mcp.md (bot-mcp/term|protocol|delimiter-u-f8ff, bot-mcp/trap|protocol|raw-json-assumption): \"Do not replace the delimiter without updating the game server protocol.\"",
+      "scope": ["*.mjs", "*.cjs"],
+      "severity": "high"
+    },
+    {
+      "id": "botmcp-token-required",
+      "rule": "Bot authentication is required. Do not make HUBZZ_BOT_TOKEN optional or bypass the token check for normal/production bot sessions, and do not send the token to non-allowlisted wsUrls. Source: russfranky/drift notes/hubzz-contracts/bot-mcp.md (bot-mcp/trap|connection|token-env): \"Do not bypass HUBZZ_BOT_TOKEN checks for production bot sessions.\"",
+      "scope": ["*.mjs", "*.cjs"],
+      "severity": "high"
+    },
+    {
+      "id": "botmcp-ready-after-acc-ok",
+      "rule": "Do not mark a connection ready before acc:ok handling completes. Source: russfranky/drift notes/hubzz-contracts/bot-mcp.md (bot-mcp/decision|connection|login-sequence): \"Do not mark connections ready before acc:ok handling completes.\"",
+      "scope": ["*.mjs", "*.cjs"],
+      "severity": "high"
+    },
+    {
+      "id": "botmcp-buffer-caps",
+      "rule": "Keep the MAX_* observation buffer caps (chat, events, errors, notices, latencies). Source: russfranky/drift notes/hubzz-contracts/bot-mcp.md (bot-mcp/contract|buffers|chat-event-caps): \"Do not remove buffer limits on long-running bot sessions.\"",
+      "scope": ["*.mjs", "*.cjs"],
+      "severity": "medium"
+    }
+  ]
+}
