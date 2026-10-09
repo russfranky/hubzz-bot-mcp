@@ -1,0 +1,6 @@
+{
+  "files": [
+    { "path": "CLAUDE.md", "description": "Repo agent instructions and conventions." },
+    { "path": "README.md", "description": "Tool catalog, env vars (HUBZZ_WS_URL, HUBZZ_API_URL, HUBZZ_BOT_TOKEN), start workflow." }
+  ]
+}
