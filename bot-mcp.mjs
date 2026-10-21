@@ -95,7 +95,7 @@ function fetchJsonViaCurl(url, timeoutMs) {
     }
     const args = [
       '-sS', '-f',           // silent, fail on HTTP error
-      '--proxy', process.env.https_proxy || process.env.HTTPS_PROXY,
+      ...((process.env.https_proxy || process.env.HTTPS_PROXY) ? ['--proxy', process.env.https_proxy || process.env.HTTPS_PROXY] : []),
       '--max-time', String(Math.ceil(timeoutMs / 1000)),
       '-L', '--max-redirs', '5',
       '--',                  // S-002: end of options — url cannot be parsed as flags
@@ -168,7 +168,7 @@ function httpGetJson(url, timeoutMs = 30000, retries = 2) {
     const attempt = (n) => {
       const args = [
         '-sS',
-        '--proxy', process.env.https_proxy || process.env.HTTPS_PROXY,
+        ...((process.env.https_proxy || process.env.HTTPS_PROXY) ? ['--proxy', process.env.https_proxy || process.env.HTTPS_PROXY] : []),
         '--max-time', String(Math.ceil(timeoutMs / 1000)),
         '-L', '--max-redirs', '5',
         '-w', '\n%{http_code}',
